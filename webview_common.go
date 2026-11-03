@@ -8,6 +8,10 @@ import (
 	"unsafe"
 )
 
+// ErrBridgeDisabled is returned by Bind and Unbind on a web view created with
+// Options.NoBridge.
+var ErrBridgeDisabled = errors.New("webview: bridge disabled (Options.NoBridge)")
+
 // Hints are used to configure window sizing and resizing.
 type Hint int
 
@@ -66,8 +70,28 @@ type WebView interface {
 	// w.Navigate("data:text/html;base64,PGgxPkhlbGxvPC9oMT4=")
 	Navigate(url string)
 
+	// GoBack, GoForward, Reload and Stop act on the page's history and load
+	// like the browser buttons of the same name; each is a no-op when there is
+	// nothing to do.
+	GoBack()
+	GoForward()
+	Reload()
+	Stop()
+
+	// Find selects and scrolls to the next match of text in the page, from
+	// the current selection, ignoring case and wrapping at the end; backwards
+	// searches up. done, when not nil, learns on the UI thread whether there
+	// was a match. Finding the same text again moves to the next match;
+	// empty text ends the search, clearing highlights where the engine draws
+	// them. A no-op on Windows (done gets false).
+	Find(text string, backwards bool, done func(found bool))
+
+	// SetZoom scales the page, text and images alike: 1 is 100%. The factor
+	// stays with the web view across navigations. A no-op on Windows.
+	SetZoom(factor float64)
+
 	// SetHtml sets the webview HTML directly.
-	// Example: w.SetHtml(w, "<h1>Hello</h1>");
+	// Example: w.SetHtml("<h1>Hello</h1>")
 	SetHtml(html string)
 
 	// Init injects JavaScript code at the initialization of the new page. Every
@@ -79,6 +103,30 @@ type WebView interface {
 	// also the result of the expression is ignored. Use RPC bindings if you want
 	// to receive notifications about the results of the evaluation.
 	Eval(js string)
+
+	// Focus moves keyboard focus into the web content, so typing - and a screen
+	// reader's cursor - lands inside the page without the user having to click it
+	// first. Each platform already does this when its window first appears and
+	// when the window is re-activated; Focus is the explicit, on-demand version
+	// for pulling focus back into the page. Call it from the UI thread.
+	Focus()
+
+	// Raise brings the window to the FRONT and gives the application focus, so
+	// it is clickable again without the user having to click twice. This is the
+	// case Focus does not cover: Focus moves the caret inside the page, Raise
+	// moves the window in front of everything else.
+	//
+	// The case it exists for: a program that took focus away from itself —
+	// launching a child window that activates, finishing a job that raised
+	// something else — and now needs its own window usable again. On macOS that
+	// matters more than it sounds, because a click on an inactive window is
+	// spent activating it (see Options.AcceptsFirstMouse), and for web content
+	// even that opt-in is not always enough.
+	//
+	// It is deliberately blunt, which is also why it should be used sparingly:
+	// stealing focus from someone typing in another application is worse than
+	// the second click it saves. Call it from the UI thread.
+	Raise()
 
 	// Bind binds a callback function so that it will appear under the given name
 	// as a global JavaScript function. Internally it uses webview_init().
@@ -92,6 +140,34 @@ type WebView interface {
 
 	// Removes a callback that was previously set by Bind.
 	Unbind(name string) error
+
+	// --- Native file dialogs (a glaze extension; upstream webview has none) ---
+	//
+	// These present a native, application-modal file chooser. Unlike the other
+	// WebView methods, they BLOCK the calling goroutine until the user dismisses
+	// the dialog and therefore must NOT be called from the UI thread (doing so
+	// deadlocks). Call them from a Bind callback - which runs on a background
+	// goroutine - or any other goroutine. They require the main loop to be
+	// running (Run has been called).
+	//
+	// A cancelled dialog returns an empty result and a nil error; a non-nil
+	// error means the dialog could not be presented.
+
+	// OpenFile shows an "open file" dialog and returns the chosen path, or "" if
+	// the user cancelled.
+	OpenFile(opts FileDialogOptions) (string, error)
+
+	// OpenFiles shows an "open file" dialog that allows selecting multiple files
+	// and returns the chosen paths, or nil if the user cancelled.
+	OpenFiles(opts FileDialogOptions) ([]string, error)
+
+	// SaveFile shows a "save file" dialog and returns the chosen path, or "" if
+	// the user cancelled.
+	SaveFile(opts FileDialogOptions) (string, error)
+
+	// OpenDirectory shows a directory chooser and returns the chosen directory
+	// path, or "" if the user cancelled.
+	OpenDirectory(opts FileDialogOptions) (string, error)
 }
 
 var errorType = reflect.TypeFor[error]()
@@ -135,7 +211,8 @@ func makeFuncWrapper(f any) (func(id, req string) (any, error), error) {
 
 	fn := func(id, req string) (any, error) {
 		var rawArgs []json.RawMessage
-		if err := json.Unmarshal([]byte(req), &rawArgs); err != nil {
+		err := json.Unmarshal([]byte(req), &rawArgs)
+		if err != nil {
 			return nil, err
 		}
 		if (!isVariadic && len(rawArgs) != numIn) || (isVariadic && len(rawArgs) < numIn-1) {
@@ -150,7 +227,8 @@ func makeFuncWrapper(f any) (func(id, req string) (any, error), error) {
 			} else {
 				argVal = reflect.New(inTypes[i])
 			}
-			if err := json.Unmarshal(rawArgs[i], argVal.Interface()); err != nil {
+			err = json.Unmarshal(rawArgs[i], argVal.Interface())
+			if err != nil {
 				return nil, err
 			}
 			args[i] = argVal.Elem()
@@ -163,7 +241,8 @@ func makeFuncWrapper(f any) (func(id, req string) (any, error), error) {
 			return nil, nil //nolint:nilnil
 		case 1:
 			if returnsError {
-				if v := res[0].Interface(); v != nil {
+				v := res[0].Interface()
+				if v != nil {
 					return nil, v.(error)
 				}
 				return nil, nil //nolint:nilnil
@@ -171,7 +250,8 @@ func makeFuncWrapper(f any) (func(id, req string) (any, error), error) {
 			return res[0].Interface(), nil
 		case 2:
 			var err error
-			if v := res[1].Interface(); v != nil {
+			v := res[1].Interface()
+			if v != nil {
 				err = v.(error)
 			}
 			return res[0].Interface(), err
@@ -191,7 +271,8 @@ func makeFuncWrapper(f any) (func(id, req string) (any, error), error) {
 // caller's Promise pending forever.
 func callAndMarshal(fn func(id, req string) (any, error), id, req string) (status int, result string) {
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		if r != nil {
 			status = -1
 			result = marshalJSON(fmt.Sprintf("binding panicked: %v", r))
 		}
@@ -213,4 +294,14 @@ func callAndMarshal(fn func(id, req string) (any, error), id, req string) (statu
 func marshalJSON(msg string) string {
 	data, _ := json.Marshal(msg) // json.Marshal on string never fails
 	return string(data)
+}
+
+// callClose runs Options.OnClose, if set, with panic containment like the
+// other callbacks: an app bug must not take the UI thread's loop down.
+func callClose(f func()) {
+	if f == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	f()
 }

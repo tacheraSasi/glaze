@@ -1,9 +1,9 @@
-//go:build windows
-
 package glaze
 
 import (
 	"errors"
+	"flag"
+	"fmt"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -22,6 +22,8 @@ var (
 	resWinRichTypes   atomic.Value // string
 	resWinEmbed       atomic.Value // string
 	resWinClose       atomic.Value // string
+	resWinOnClose     atomic.Value // string
+	resWinDialogCfg   atomic.Value // string
 )
 
 // guiAvailable reports whether the Edge WebView2 Runtime is installed. Without
@@ -44,12 +46,17 @@ func requireGUI(t *testing.T, got string) {
 }
 
 func TestMain(m *testing.M) {
+	flag.Parse()
 	runtime.LockOSThread()
-	if guiAvailable() {
+	if !testing.Short() && guiAvailable() {
 		resWinBridge.Store(winBridgeScenario())
 		resWinErrorUnbind.Store(winErrorUnbindScenario())
 		resWinRichTypes.Store(winRichTypesScenario())
 		resWinEmbed.Store(winEmbedScenario())
+		resWinDialogCfg.Store(winDialogConfigScenario())
+		resNoBridge.Store(noBridgeScenario())
+		resWinOnClose.Store(winOnCloseScenario())
+		resWinScheme.Store(winSchemeScenario())
 		resWinClose.Store(winCloseViaUIScenario()) // last: it ends with WM_QUIT
 	}
 	os.Exit(m.Run())
@@ -69,7 +76,7 @@ func winCloseViaUIScenario() string {
 
 	var watchdogFired atomic.Bool
 	time.AfterFunc(2*time.Second, func() { postMessageW(hwnd, wmClose, 0, 0) })
-	time.AfterFunc(40*time.Second, func() { watchdogFired.Store(true); w.Terminate() })
+	defer time.AfterFunc(40*time.Second, func() { watchdogFired.Store(true); w.Terminate() }).Stop()
 
 	w.SetHtml(`<!DOCTYPE html><html><body>close test</body></html>`)
 	w.Run() // must return once WM_CLOSE posts WM_QUIT
@@ -83,7 +90,8 @@ func winCloseViaUIScenario() string {
 // winEmbedScenario embeds a web view into a caller-provided HWND and verifies
 // the engine does not take ownership and Destroy leaves the host window intact.
 func winEmbedScenario() string {
-	if err := ensureWinInit(); err != nil {
+	err := ensureWinInit()
+	if err != nil {
 		return "init error: " + err.Error()
 	}
 	host := createWindowExW(0, utf16("STATIC"), utf16("host"), wsOverlappedWindow,
@@ -97,6 +105,41 @@ func winEmbedScenario() string {
 		return "new error: " + err.Error()
 	}
 	owns := w.(*webview).ownsWindow
+
+	// Issue #29: the embedded WebView must follow the host window. SetWindowPos
+	// SENDS WM_SIZE synchronously through the subclass chain, so right after it
+	// returns the controller bounds must match the new client rect — no message
+	// pump involved.
+	setWindowPos(host, 0, 0, 0, 500, 400, swpNoZOrder|swpNoActivate|swpNoMove)
+	var want, got rect
+	getClientRect(host, &want)
+	asController(w.(*webview).controller).getBounds(&got)
+	if got != want {
+		w.Destroy()
+		destroyWindow(host)
+		return fmt.Sprintf("bounds after host resize = %+v, want %+v (WM_SIZE not routed)", got, want)
+	}
+
+	// Dispatch in embed mode rides WM_APP through the same subclass. The
+	// closure is already queued before the pump starts, and sentinel messages
+	// keep GetMessage from blocking if it is ever NOT picked up (the old
+	// GWLP_USERDATA approach dropped it silently).
+	ran := false
+	w.Dispatch(func() { ran = true })
+	for range 8 {
+		postMessageW(host, wmApp+1, 0, 0)
+	}
+	var m msgStruct
+	for i := 0; i < 9 && !ran && getMessageW(&m, 0, 0, 0) > 0; i++ {
+		translateMessage(&m)
+		dispatchMessageW(&m)
+	}
+	if !ran {
+		w.Destroy()
+		destroyWindow(host)
+		return "Dispatch closure never ran in embed mode (WM_APP not routed)"
+	}
+
 	w.Destroy()
 	// A valid window still returns its style; a destroyed HWND returns 0.
 	alive := getWindowLongPtrW(host, gwlStyle) != 0
@@ -118,11 +161,93 @@ func TestEmbedExternalWindow(t *testing.T) {
 	}
 }
 
+// winDialogConfigScenario verifies that the Common Item Dialog COM plumbing
+// works: a FileOpenDialog is created via CoCreateInstance, its options round-trip
+// through SetOptions/GetOptions, and a title + file-type filters are applied --
+// all without calling Show (which is modal and needs user input). The full
+// dialog is exercised manually via examples/filedialog.
+func winDialogConfigScenario() string {
+	err := ensureDialogInit()
+	if err != nil {
+		return "dialog init error: " + err.Error()
+	}
+	coInitializeEx(0, coinitApartmentThreaded) // ensure STA on the test thread
+	var pdlg uintptr
+	hr := coCreateInstance(&clsidFileOpenDialog, 0, clsctxInprocServer, &iidIFileOpenDialog, &pdlg)
+	if hr < 0 || pdlg == 0 {
+		return fmt.Sprintf("CoCreateInstance failed: 0x%08X", uint32(hr))
+	}
+	dlg := (*iFileDialog)(ptr(pdlg))
+	defer dlg.Release()
+
+	dlg.SetOptions(dlg.GetOptions() | fosForceFilesystem | fosPickFolders | fosAllowMultiSelect)
+	got := dlg.GetOptions()
+	if got&fosPickFolders == 0 || got&fosAllowMultiSelect == 0 {
+		return fmt.Sprintf("options roundtrip lost bits: 0x%08X", got)
+	}
+	dlg.SetTitle(utf16("Pick"))
+	specs, keep := buildFilterSpecs([]FileFilter{{Name: "Images", Extensions: []string{"png", "jpg"}}})
+	if len(specs) != 1 {
+		return "filter spec build failed"
+	}
+	dlg.SetFileTypes(uint32(len(specs)), &specs[0])
+	runtime.KeepAlive(keep)
+	return "dialog-config-ok"
+}
+
+func TestDialogConfig(t *testing.T) {
+	got, _ := resWinDialogCfg.Load().(string)
+	requireGUI(t, got)
+	if got != "dialog-config-ok" {
+		t.Fatalf("dialog config = %q, want %q", got, "dialog-config-ok")
+	}
+}
+
 func TestCloseViaUI(t *testing.T) {
 	got, _ := resWinClose.Load().(string)
 	requireGUI(t, got)
 	if got != "closed" {
 		t.Fatalf("close via UI = %q, want %q", got, "closed")
+	}
+}
+
+// winOnCloseScenario opens two windows and closes the first as the person
+// would (WM_CLOSE): only its OnClose runs, Run keeps serving the second one,
+// and Destroy never calls OnClose.
+func winOnCloseScenario() string {
+	var closedA, closedB int
+	a, err := NewWithOptions(Options{OnClose: func() { closedA++ }})
+	if err != nil {
+		return "new a: " + err.Error()
+	}
+	b, err := NewWithOptions(Options{OnClose: func() { closedB++ }})
+	if err != nil {
+		a.Destroy()
+		return "new b: " + err.Error()
+	}
+	a.SetHtml("<p>a</p>")
+	b.SetHtml("<p>b</p>")
+	var bAlive bool
+	postMessageW(a.(*webview).window, wmClose, 0, 0)
+	time.AfterFunc(2*time.Second, func() {
+		b.Dispatch(func() {
+			bAlive = b.Window() != nil
+			b.Terminate()
+		})
+	})
+	defer time.AfterFunc(40*time.Second, b.Terminate).Stop()
+	b.Run()
+	a.Destroy()
+	b.Destroy()
+	return fmt.Sprintf("a=%d b=%d aGone=%v bAlive=%v", closedA, closedB, a.Window() == nil, bAlive)
+}
+
+func TestOnClose(t *testing.T) {
+	got, _ := resWinOnClose.Load().(string)
+	requireGUI(t, got)
+	want := "a=1 b=0 aGone=true bAlive=true"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
@@ -144,7 +269,7 @@ func winBridgeScenario() string {
 		}
 		w.Terminate()
 	})
-	time.AfterFunc(40*time.Second, w.Terminate) // watchdog
+	defer time.AfterFunc(40*time.Second, w.Terminate).Stop() // watchdog
 
 	w.SetHtml(`<!DOCTYPE html><html><body><script>
 window.addEventListener('load', async function(){
@@ -188,7 +313,7 @@ func winErrorUnbindScenario() string {
 	_ = w.Bind("boom", func() (string, error) { return "", errors.New("kaboom") })
 	_ = w.Bind("temp", func() string { return "x" })
 	_ = w.Unbind("temp")
-	time.AfterFunc(40*time.Second, w.Terminate)
+	defer time.AfterFunc(40*time.Second, w.Terminate).Stop()
 
 	w.SetHtml(`<!DOCTYPE html><html><body><script>
 window.addEventListener('load', async function(){
@@ -235,7 +360,7 @@ func winRichTypesScenario() string {
 		}
 		return t
 	})
-	time.AfterFunc(40*time.Second, w.Terminate)
+	defer time.AfterFunc(40*time.Second, w.Terminate).Stop()
 
 	w.SetHtml(`<!DOCTYPE html><html><body><script>
 window.addEventListener('load', async function(){

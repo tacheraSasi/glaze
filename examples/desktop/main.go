@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/crgimenes/devengine/assets"
 	"github.com/crgimenes/devengine/db/sqlite"
@@ -45,7 +46,8 @@ func (s *NoteService) Add(text string) (Note, error) {
 	}
 	var note Note
 	row := s.store.QueryRowRW(`SELECT id, text FROM notes ORDER BY id DESC LIMIT 1`)
-	if err := row.Scan(&note.ID, &note.Text); err != nil {
+	err = row.Scan(&note.ID, &note.Text)
+	if err != nil {
 		return Note{}, err
 	}
 	return note, nil
@@ -56,12 +58,13 @@ func (s *NoteService) List() ([]Note, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var notes []Note
 	for rows.Next() {
 		var n Note
-		if err := rows.Scan(&n.ID, &n.Text); err != nil {
+		err = rows.Scan(&n.ID, &n.Text)
+		if err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
@@ -76,7 +79,8 @@ func (s *NoteService) Delete(id int64) error {
 func (s *NoteService) Count() (int, error) {
 	var count int
 	row := s.store.QueryRow(`SELECT COUNT(*) FROM notes`)
-	if err := row.Scan(&count); err != nil {
+	err := row.Scan(&count)
+	if err != nil {
 		return 0, err
 	}
 	return count, nil
@@ -227,13 +231,14 @@ func startAssetServer() (string, error) {
 	// Serve the main page.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := pageTemplate.Execute(w, nil); err != nil {
+		err := pageTemplate.Execute(w, nil)
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	})
 
 	go func() {
-		srv := &http.Server{Handler: mux}
+		srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 		_ = srv.Serve(ln)
 	}()
 

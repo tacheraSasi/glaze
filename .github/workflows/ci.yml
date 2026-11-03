@@ -12,8 +12,8 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
         stack: [gtk3, gtk4]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: Install ${{ matrix.stack }} + xvfb
@@ -46,19 +46,22 @@ jobs:
       - name: Headless safety (GUI tests must skip)
         run: go test -count=1 ./...
       - name: Test (xvfb)
+        timeout-minutes: 6
         env:
           WEBKIT_DISABLE_COMPOSITING_MODE: '1'
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
           LIBGL_ALWAYS_SOFTWARE: '1'
         # -count=1 so the GUI tests actually run here instead of reusing the
-        # cached skip from the headless step above.
-        run: xvfb-run -a go test -count=1 ./...
+        # cached skip from the headless step above. -timeout 150s so a wedged GTK
+        # call (e.g. gtk_init blocking on a missing display/bus) fails fast with a
+        # goroutine dump instead of running to go test's 10m default.
+        run: xvfb-run -a go test -count=1 -timeout 150s ./...
 
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go build ./...
@@ -70,8 +73,8 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go build ./...
@@ -81,25 +84,61 @@ jobs:
       # windows-latest ships the Edge WebView2 Runtime; the test opens a real
       # WebView2 window and exercises the JS<->Go bridge round trip.
       - name: Test
-        timeout-minutes: 6
+        timeout-minutes: 5
         env:
           WEBVIEW2_DEBUG: '1'
-        run: go test -timeout 180s .
+        shell: pwsh
+        run: |
+          # Compile the tests first so the watchdog below times only the run, not
+          # the (slower) Windows build.
+          go test -c -o glaze_test.exe .
+          # go test's own -timeout prints a goroutine dump, but a process wedged in
+          # a modal COM / Win32 call (WebView2, a file dialog) can fail to actually
+          # exit. Run it under an external hard watchdog (WaitForExit +
+          # Stop-Process) so a hang fails the job fast and still prints stdout/stderr.
+          $p = Start-Process -FilePath .\glaze_test.exe `
+            -ArgumentList '-test.v','-test.timeout=180s' `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput out.txt -RedirectStandardError err.txt
+          $exited = $p.WaitForExit(210000)
+          if (Test-Path out.txt) { Get-Content out.txt }
+          if (Test-Path err.txt) { Get-Content err.txt }
+          if (-not $exited) {
+            Write-Host "::error::Windows test hung; force-killing after 210s"
+            Stop-Process -Id $p.Id -Force
+            exit 1
+          }
+          exit $p.ExitCode
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: gofmt
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      # Both modules, because a bump in the root (a dep, or the go directive)
+      # leaves examples/ behind and the build only says "no go files to analyze"
+      # after the whole matrix has downloaded its dependencies.
+      - name: go.mod tidy
+        run: |
+          go mod tidy -diff || { echo "go.mod/go.sum not tidy: run go mod tidy"; exit 1; }
+          (cd examples && go mod tidy -diff) || { echo "examples not tidy: run (cd examples && go mod tidy)"; exit 1; }
       - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
       - name: Lint (every backend / GOOS)
         run: |
           for os in darwin linux windows; do
             echo "== GOOS=$os =="
+            GOOS=$os $(go env GOPATH)/bin/golangci-lint run ./...
+          done
+      # examples/ is a separate module, so the root ./... above does not reach it.
+      - name: Lint examples (every GOOS)
+        run: |
+          cd examples
+          for os in darwin linux windows; do
+            echo "== examples GOOS=$os =="
             GOOS=$os $(go env GOPATH)/bin/golangci-lint run ./...
           done

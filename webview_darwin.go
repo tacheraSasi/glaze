@@ -13,9 +13,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	neturl "net/url"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -32,13 +37,24 @@ const (
 
 	nsApplicationActivationPolicyRegular = 0
 
+	nsEventTypeKeyDown            = 10
 	nsEventTypeApplicationDefined = 15
 	nsEventMaskAny                = ^uint(0)
 
+	nsViewMinXMargin    = 1 << 0
 	nsViewWidthSizable  = 1 << 1
+	nsViewMaxXMargin    = 1 << 2
+	nsViewMinYMargin    = 1 << 3
 	nsViewHeightSizable = 1 << 4
+	nsViewMaxYMargin    = 1 << 5
+
+	nsProgressIndicatorStyleSpinning = 1
 
 	nsModalResponseOK = 1
+
+	// nsURLErrorFileDoesNotExist is Foundation's NSURLErrorFileDoesNotExist,
+	// reported to a URL-scheme task when its handler has no resource to serve.
+	nsURLErrorFileDoesNotExist = -1100
 
 	wkInjectionTimeAtDocumentStart = 0
 
@@ -60,7 +76,8 @@ type cgRect struct {
 var selCache sync.Map // string -> objc.SEL
 
 func sel(name string) objc.SEL {
-	if v, ok := selCache.Load(name); ok {
+	v, ok := selCache.Load(name)
+	if ok {
 		return v.(objc.SEL)
 	}
 	s := objc.RegisterName(name)
@@ -85,16 +102,21 @@ func cstr(id objc.ID) string {
 	if id == 0 {
 		return ""
 	}
-	ptr := *(*unsafe.Pointer)(unsafe.Pointer(&id)) // circumvent go vet
+	// Reinterpret the objc.ID's bits without a uintptr->Pointer cast (keeps go
+	// vet's unsafeptr check quiet); the pointer is C string memory, not a Go
+	// pointer.
+	ptr := *(*unsafe.Pointer)(unsafe.Pointer(&id)) // #nosec G103
 	var n int
 	for *(*byte)(unsafe.Add(ptr, n)) != 0 {
 		n++
 	}
-	return string(unsafe.Slice((*byte)(ptr), n))
+	return string(unsafe.Slice((*byte)(ptr), n)) // #nosec G103 -- slice over the C string buffer
 }
 
 // autorelease wraps f in an NSAutoreleasePool, draining it afterward.
 func autorelease(f func()) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	pool := class("NSAutoreleasePool").Send(sel("alloc")).Send(sel("init"))
 	defer pool.Send(sel("drain"))
 	f()
@@ -111,6 +133,10 @@ var (
 	dispatchWork   uintptr
 
 	appDelegateClass, scriptHandlerClass, windowDelegateClass, uiDelegateClass objc.Class
+	paintHandlerClass, paintCoverClass                                         objc.Class
+	schemeHandlerClass, firstMouseViewClass, navDelegateClass                  objc.Class
+	webViewClass                                                               objc.Class
+	downloadDelegateClass                                                      objc.Class
 )
 
 // Init prepares the macOS backend: loads AppKit + WebKit and registers the
@@ -123,7 +149,8 @@ func ensureInit() error {
 			"/System/Library/Frameworks/Cocoa.framework/Cocoa",
 			"/System/Library/Frameworks/WebKit.framework/WebKit",
 		} {
-			if _, err := purego.Dlopen(fw, purego.RTLD_GLOBAL|purego.RTLD_LAZY); err != nil {
+			_, err := purego.Dlopen(fw, purego.RTLD_GLOBAL|purego.RTLD_LAZY)
+			if err != nil {
 				initErr = fmt.Errorf("webview: dlopen %s: %w", fw, err)
 				return
 			}
@@ -161,10 +188,22 @@ func registerClasses() error {
 				Fn:  func(self objc.ID, _cmd objc.SEL, sender objc.ID) bool { return false },
 			},
 			{
+				Cmd: sel("application:openURLs:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, app, urls objc.ID) {
+					callOpenURLs(currentOpenURLs(), nsURLStrings(urls))
+					w := lookupEngine(self)
+					if w != nil {
+						w.urlsArrived = true
+						w.endURLWait()
+					}
+				},
+			},
+			{
 				Cmd: sel("applicationDidFinishLaunching:"),
 				Fn: func(self objc.ID, _cmd objc.SEL, notification objc.ID) {
-					if w := lookupEngine(self); w != nil {
-						w.onApplicationDidFinishLaunching(notification.Send(sel("object")))
+					w := lookupEngine(self)
+					if w != nil {
+						w.onApplicationDidFinishLaunching(notification)
 					}
 				},
 			},
@@ -179,7 +218,8 @@ func registerClasses() error {
 		[]objc.MethodDef{{
 			Cmd: sel("userContentController:didReceiveScriptMessage:"),
 			Fn: func(self objc.ID, _cmd objc.SEL, ucc objc.ID, message objc.ID) {
-				if w := lookupEngine(self); w != nil {
+				w := lookupEngine(self)
+				if w != nil {
 					w.onMessage(cstr(message.Send(sel("body")).Send(sel("UTF8String"))))
 				}
 			},
@@ -188,13 +228,42 @@ func registerClasses() error {
 		return fmt.Errorf("webview: script handler class: %w", err)
 	}
 
+	paintHandlerClass, err = objc.RegisterClass(
+		"GlazePaintHandler", objc.GetClass("NSObject"),
+		[]*objc.Protocol{objc.GetProtocol("WKScriptMessageHandler")}, nil,
+		[]objc.MethodDef{{
+			Cmd: sel("userContentController:didReceiveScriptMessage:"),
+			Fn: func(self objc.ID, _cmd objc.SEL, ucc objc.ID, message objc.ID) {
+				w := lookupEngine(self)
+				if w != nil {
+					w.revealContent()
+				}
+			},
+		}})
+	if err != nil {
+		return fmt.Errorf("webview: paint handler class: %w", err)
+	}
+
+	// The cover takes the keys while the page is held back; a plain NSView
+	// refuses them, and AppKit would hand them to the transparent web view.
+	paintCoverClass, err = objc.RegisterClass(
+		"GlazePaintCover", objc.GetClass("NSView"), nil, nil,
+		[]objc.MethodDef{{
+			Cmd: sel("acceptsFirstResponder"),
+			Fn:  func(self objc.ID, _cmd objc.SEL) bool { return true },
+		}})
+	if err != nil {
+		return fmt.Errorf("webview: paint cover class: %w", err)
+	}
+
 	windowDelegateClass, err = objc.RegisterClass(
 		"GlazeWindowDelegate", objc.GetClass("NSObject"),
 		[]*objc.Protocol{objc.GetProtocol("NSWindowDelegate")}, nil,
 		[]objc.MethodDef{{
 			Cmd: sel("windowWillClose:"),
 			Fn: func(self objc.ID, _cmd objc.SEL, notification objc.ID) {
-				if w := lookupEngine(self); w != nil {
+				w := lookupEngine(self)
+				if w != nil {
 					w.onWindowWillClose()
 				}
 			},
@@ -206,15 +275,201 @@ func registerClasses() error {
 	uiDelegateClass, err = objc.RegisterClass(
 		"GlazeUIDelegate", objc.GetClass("NSObject"),
 		[]*objc.Protocol{objc.GetProtocol("WKUIDelegate")}, nil,
-		[]objc.MethodDef{{
-			Cmd: sel("webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:"),
-			Fn:  runOpenPanel,
-		}})
+		[]objc.MethodDef{
+			{
+				Cmd: sel("webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:"),
+				Fn:  runOpenPanel,
+			},
+			{
+				// macOS 12+; without it WebKit asks the user itself.
+				Cmd: sel("webView:requestMediaCapturePermissionForOrigin:initiatedByFrame:type:decisionHandler:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, origin, frame objc.ID, kind int, handler objc.ID) {
+					decision := int64(wkPermissionDeny)
+					w := lookupEngine(self)
+					if w != nil && w.decideMediaCapture(securityOrigin(origin), kind != wkMediaCaptureMicrophone, kind != wkMediaCaptureCamera) {
+						decision = wkPermissionGrant
+					}
+					invokeNativeBlock(handler, "v@?q", unsafe.Pointer(&decision)) // #nosec G103 -- the arg's address, for NSInvocation
+				},
+			},
+			{
+				Cmd: sel("webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, message, frame, handler objc.ID) {
+					scriptDialog(self, ScriptDialog{Kind: ScriptAlert, Message: cstr(message.Send(sel("UTF8String")))})
+					invokeNativeBlock(handler, "v@?", nil)
+				},
+			},
+			{
+				Cmd: sel("webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, message, frame, handler objc.ID) {
+					ok, _ := scriptDialog(self, ScriptDialog{Kind: ScriptConfirm, Message: cstr(message.Send(sel("UTF8String")))})
+					invokeNativeBlock(handler, "v@?B", unsafe.Pointer(&ok)) // #nosec G103 -- the arg's address, for NSInvocation
+				},
+			},
+			{
+				Cmd: sel("webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, prompt, defaultText, frame, handler objc.ID) {
+					ok, text := scriptDialog(self, ScriptDialog{Kind: ScriptPrompt,
+						Message: cstr(prompt.Send(sel("UTF8String"))), Text: cstr(defaultText.Send(sel("UTF8String")))})
+					answer := objc.ID(0) // nil: prompt() returns null
+					if ok {
+						answer = nsstr(text)
+					}
+					invokeNativeBlock(handler, "v@?@", unsafe.Pointer(&answer)) // #nosec G103 -- the arg's address, for NSInvocation
+				},
+			},
+			{
+				// Returning nil creates no web view: the request goes to
+				// OnNewWindow instead of opening a window here.
+				Cmd: sel("webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, config, action, features objc.ID) objc.ID {
+					w := lookupEngine(self)
+					if w != nil {
+						url := absoluteString(action.Send(sel("request")).Send(sel("URL")))
+						callURL(w.onNewWindow, url)
+					}
+					return 0
+				},
+			},
+		})
 	if err != nil {
 		return fmt.Errorf("webview: ui delegate class: %w", err)
 	}
+
+	err = registerNavigationClasses()
+	if err != nil {
+		return err
+	}
+
+	schemeHandlerClass, err = objc.RegisterClass(
+		"GlazeURLSchemeHandler", objc.GetClass("NSObject"),
+		[]*objc.Protocol{objc.GetProtocol("WKURLSchemeHandler")}, nil,
+		[]objc.MethodDef{
+			{Cmd: sel("webView:startURLSchemeTask:"), Fn: startURLSchemeTask},
+			{Cmd: sel("webView:stopURLSchemeTask:"), Fn: stopURLSchemeTask},
+		})
+	if err != nil {
+		return fmt.Errorf("webview: url scheme handler class: %w", err)
+	}
+
+	// A WKWebView that answers YES to acceptsFirstMouse:, used only when
+	// Options.AcceptsFirstMouse asks for it. NSView's default is NO, so a click
+	// on an inactive window is spent activating it and never reaches the page —
+	// the "I had to click twice" complaint. Subclassing is the whole mechanism:
+	// AppKit asks the VIEW under the cursor, and there is no window-level or
+	// runtime switch for it.
+	menuMethod, err := contextMenuMethod()
+	if err != nil {
+		return fmt.Errorf("webview: context menu: %w", err)
+	}
+	firstMouseViewClass, err = objc.RegisterClass(
+		"GlazeFirstMouseWebView", objc.GetClass("WKWebView"), nil, nil,
+		[]objc.MethodDef{{
+			Cmd: sel("acceptsFirstMouse:"),
+			Fn:  func(self objc.ID, _cmd objc.SEL, event objc.ID) bool { return true },
+		}, menuMethod})
+	if err != nil {
+		return fmt.Errorf("webview: first-mouse web view class: %w", err)
+	}
+	webViewClass, err = objc.RegisterClass(
+		"GlazeWebView", objc.GetClass("WKWebView"), nil, nil,
+		[]objc.MethodDef{menuMethod})
+	if err != nil {
+		return fmt.Errorf("webview: web view class: %w", err)
+	}
 	return nil
 }
+
+// contextMenuMethod takes out of the page's context menu the download items
+// WKWebView only carries out for an app with WebKit's private download
+// delegate: under glaze they would do nothing. Downloads the page starts
+// still reach OnDownload.
+//
+// WKWebView's own willOpenMenu:withEvent: is called by its implementation,
+// not with SendSuper: WebKit observes the view with KVO, which swaps the
+// instance's class for a generated subclass of ours, so "the superclass of
+// the object's class" is our class again and the call never ends.
+func contextMenuMethod() (objc.MethodDef, error) {
+	lib, err := purego.Dlopen("/usr/lib/libobjc.A.dylib", purego.RTLD_GLOBAL|purego.RTLD_LAZY)
+	if err != nil {
+		return objc.MethodDef{}, err
+	}
+	var methodImplementation func(cls objc.Class, name objc.SEL) uintptr
+	purego.RegisterLibFunc(&methodImplementation, lib, "class_getMethodImplementation")
+	name := sel("willOpenMenu:withEvent:")
+	wkWillOpenMenu := methodImplementation(objc.GetClass("WKWebView"), name)
+	return objc.MethodDef{
+		Cmd: name,
+		Fn: func(self objc.ID, _cmd objc.SEL, menu, event objc.ID) {
+			purego.SyscallN(wkWillOpenMenu, uintptr(self), uintptr(_cmd), uintptr(menu), uintptr(event))
+			removeMenuItems(menu, deadDownloadItems)
+		},
+	}, nil
+}
+
+var deadDownloadItems = map[string]bool{
+	"WKMenuItemIdentifierDownloadLinkedFile": true,
+	"WKMenuItemIdentifierDownloadImage":      true,
+	"WKMenuItemIdentifierDownloadMedia":      true,
+}
+
+func removeMenuItems(menu objc.ID, ids map[string]bool) {
+	for i := objc.Send[int](menu, sel("numberOfItems")) - 1; i >= 0; i-- {
+		id := menu.Send(sel("itemAtIndex:"), i).Send(sel("identifier"))
+		if id != 0 && ids[cstr(id.Send(sel("UTF8String")))] {
+			menu.Send(sel("removeItemAtIndex:"), i)
+		}
+	}
+}
+
+// startURLSchemeTask implements -webView:startURLSchemeTask:. It resolves the
+// owning webview via the scheme-handler object's registry entry, invokes the
+// registered SchemeHandler, and feeds the bytes back through the task.
+func startURLSchemeTask(self objc.ID, _cmd objc.SEL, webView objc.ID, task objc.ID) {
+	w := lookupEngine(self)
+	if w == nil {
+		return
+	}
+	req := task.Send(sel("request"))
+	nsurl := req.Send(sel("URL"))
+	urlStr := cstr(nsurl.Send(sel("absoluteString")).Send(sel("UTF8String")))
+	scheme := cstr(nsurl.Send(sel("scheme")).Send(sel("UTF8String")))
+
+	resp := w.serveScheme(scheme, urlStr)
+	autorelease(func() {
+		if resp == nil {
+			// WebKit requires a non-nil NSError here; passing nil can raise. A nil
+			// response means "not found", so report NSURLErrorFileDoesNotExist.
+			nsErr := class("NSError").Send(sel("errorWithDomain:code:userInfo:"),
+				nsstr("NSURLErrorDomain"), nsURLErrorFileDoesNotExist, objc.ID(0))
+			task.Send(sel("didFailWithError:"), nsErr)
+			return
+		}
+		body := resp.Body
+		var dataPtr unsafe.Pointer
+		if len(body) > 0 {
+			dataPtr = unsafe.Pointer(&body[0]) // #nosec G103 -- dataWithBytes:length: copies the buffer
+		}
+		data := class("NSData").Send(sel("dataWithBytes:length:"), dataPtr, len(body))
+		// A 200 NSHTTPURLResponse with a Content-Type header — an http-style
+		// response is what makes WebKit treat the custom origin as secure.
+		headers := class("NSMutableDictionary").Send(sel("dictionary"))
+		headers.Send(sel("setObject:forKey:"), nsstr(schemeMIME(resp)), nsstr("Content-Type"))
+		urlResp := class("NSHTTPURLResponse").Send(sel("alloc")).Send(
+			sel("initWithURL:statusCode:HTTPVersion:headerFields:"),
+			nsurl, 200, nsstr("HTTP/1.1"), headers)
+		// alloc/init returns a +1 object; autorelease it so it does not leak once
+		// per request (didReceiveResponse: retains what it needs).
+		urlResp.Send(sel("autorelease"))
+		task.Send(sel("didReceiveResponse:"), urlResp)
+		task.Send(sel("didReceiveData:"), data)
+		task.Send(sel("didFinish"))
+	})
+}
+
+// stopURLSchemeTask implements -webView:stopURLSchemeTask: — we complete
+// synchronously, so there is nothing to cancel.
+func stopURLSchemeTask(self objc.ID, _cmd objc.SEL, webView objc.ID, task objc.ID) {}
 
 // runOpenPanel implements WKUIDelegate's file chooser via NSOpenPanel, invoking
 // the completion handler block (driven through NSInvocation) with the URLs.
@@ -224,12 +479,10 @@ func runOpenPanel(self objc.ID, _cmd objc.SEL, webView, parameters, frame, compl
 		allowsDirs := parameters.Send(sel("allowsDirectories")) != 0
 
 		panel := class("NSOpenPanel").Send(sel("openPanel"))
-		panel.Send(sel("setCanChooseFiles:"), true)
-		panel.Send(sel("setCanChooseDirectories:"), allowsDirs)
-		panel.Send(sel("setAllowsMultipleSelection:"), allowsMultiple)
+		configureOpenPanel(panel, true, allowsDirs, allowsMultiple, FileDialogOptions{})
 
 		var urls objc.ID
-		if int(panel.Send(sel("runModal"))) == nsModalResponseOK {
+		if int(panel.Send(sel("runModal"))) == nsModalResponseOK { // #nosec G115 -- NSModalResponse is a small int
 			urls = panel.Send(sel("URLs"))
 		}
 		invokeOpenPanelCompletion(completionHandler, urls)
@@ -241,11 +494,31 @@ func runOpenPanel(self objc.ID, _cmd objc.SEL, webView, parameters, frame, compl
 // it is driven through NSInvocation with the signature "v@?@": index 0 is the
 // block itself, index 1 the NSArray<NSURL*>* argument.
 func invokeOpenPanelCompletion(completionHandler, urls objc.ID) {
-	sig := class("NSMethodSignature").Send(sel("signatureWithObjCTypes:"), "v@?@")
+	invokeNativeBlock(completionHandler, "v@?@", unsafe.Pointer(&urls)) // #nosec G103 -- the arg's address, for NSInvocation
+}
+
+// invokeNativeBlock calls a block WebKit or AppKit handed us, with one
+// argument described by types ("v@?@" an object, "v@?q" an NSInteger).
+// objc.Block.Invoke only knows blocks made by objc.NewBlock.
+func invokeNativeBlock(block objc.ID, types string, arg unsafe.Pointer) {
+	sig := class("NSMethodSignature").Send(sel("signatureWithObjCTypes:"), types)
 	inv := class("NSInvocation").Send(sel("invocationWithMethodSignature:"), sig)
-	inv.Send(sel("setTarget:"), completionHandler)
-	inv.Send(sel("setArgument:atIndex:"), unsafe.Pointer(&urls), 1)
+	inv.Send(sel("setTarget:"), block)
+	if arg != nil { // a block that takes no argument ("v@?")
+		inv.Send(sel("setArgument:atIndex:"), arg, 1)
+	}
 	inv.Send(sel("invoke"))
+}
+
+// scriptDialog answers a page's alert, confirm or prompt: through
+// OnScriptDialog, or, without one, as WebKit does when the delegate lacks the
+// method, so adding these methods changes nothing for an app that sets none.
+func scriptDialog(self objc.ID, d ScriptDialog) (ok bool, text string) {
+	w := lookupEngine(self)
+	if w == nil || w.onScriptDialog == nil {
+		return false, ""
+	}
+	return callScriptDialog(w.onScriptDialog, d)
 }
 
 // --- instance registry (replaces objc associated objects) ------------------
@@ -290,6 +563,42 @@ func dispatchMain(f func()) {
 	dispatchAsyncF(mainQueue, id, dispatchWork)
 }
 
+// onMainThread reports whether the caller runs on the process main thread —
+// the only thread AppKit accepts UI work from.
+func onMainThread() bool {
+	return class("NSThread").Send(sel("isMainThread")) != 0
+}
+
+// uiIsMain records, at first webview creation, whether the UI runs on the
+// process main thread. True in both supported shapes: creation on the main
+// thread (the normal contract), and creation marshaled to the main thread
+// because another owner's run loop is already there (native/tray). False only
+// under the legacy single-goroutine shape — everything pinned to a secondary
+// thread — where the main dispatch queue is never drained, so marshaling to
+// it would hang; performOnMain then runs inline, preserving that shape's
+// historical behavior.
+var (
+	uiIsMainOnce sync.Once
+	uiIsMain     bool
+)
+
+// performOnMain runs f on the UI thread and waits for it, running inline when
+// the caller is already there (or when the UI thread is not the main thread —
+// see uiIsMain). Off the UI thread it queues onto the main dispatch queue and
+// blocks until a running run loop drains it.
+func performOnMain(f func()) {
+	if onMainThread() || !uiIsMain {
+		f()
+		return
+	}
+	done := make(chan struct{})
+	dispatchMain(func() {
+		defer close(done)
+		f()
+	})
+	<-done
+}
+
 // --- process-wide lifecycle bookkeeping ------------------------------------
 
 var (
@@ -297,6 +606,12 @@ var (
 	notFirst     bool
 	windowCount  int32
 	uiThreadOnce sync.Once
+
+	// glazeRunsLoop is true while OUR Run() drives [NSApp run]. When the loop
+	// belongs to someone else (native/tray started it before the first webview
+	// existed), it stays false: closing the last glaze window must not stop a
+	// loop we do not own, and Terminate must not stop it either.
+	glazeRunsLoop atomic.Bool
 )
 
 func getAndSetIsFirstInstance() bool {
@@ -320,21 +635,88 @@ type webview struct {
 	appDelegate    objc.ID
 	windowDelegate objc.ID
 	uiDelegate     objc.ID
+	navDelegate    objc.ID
 	window         objc.ID
 	widget         objc.ID
 	webView        objc.ID
 	manager        objc.ID
 	scriptHandler  objc.ID
+	// paintWorld and paintHandler carry the first paint of a held-back page
+	// (see paintScript); paintCover keeps clicks off it until then.
+	paintWorld   objc.ID
+	paintHandler objc.ID
+	paintCover   objc.ID
 
 	ownsWindow bool
 	debug      bool
+	// Owned references of a window the user closed, until Destroy releases them.
+	closedWindow, closedWidget, closedWebView objc.ID
+	// firstMouse makes a click on an INACTIVE window reach the page instead of
+	// only bringing the window forward. See Options.AcceptsFirstMouse.
+	firstMouse bool
+	noBridge   bool
+	// contentHidden is true while HideUntilLoaded holds the web view back.
+	contentHidden bool
+	// spinner shows in its place when the wait passes spinnerDelay; owned by
+	// widget.
+	spinner      objc.ID
+	onNavigation func(NavigationEvent)
+	// onNavigationStart: see Options.OnNavigationStart.
+	onNavigationStart func(string)
+	// onURLChange: see Options.OnURLChange; set, navDelegate observes the
+	// web view's URL. committed and pageURL: see loadStarted.
+	onURLChange    func(string)
+	committed      bool
+	pageURL        string
+	onContentShown func()
+	// frameName: see Options.FrameAutosaveName; applied by the first SetSize.
+	frameName string
+	// awaitingURLs holds the launch loop open for the URL it was launched
+	// for, unless urlsArrived already; main thread only.
+	awaitingURLs   bool
+	urlsArrived    bool
+	onMediaCapture func(origin string, camera, microphone bool) bool
+	onScriptDialog func(ScriptDialog) (bool, string)
+	navGestures    bool
+	onNewWindow    func(string)
+	onClose        func()
+	ephemeral      bool
+	onDownload     func(string) string
+	onDownloadEnd  func(string, error)
+	// downloads maps an active WKDownload to its destination; main thread only.
+	downloads        map[objc.ID]string
+	downloadDelegate objc.ID
+	// provisionalURL is the target of the navigation in flight, for errors
+	// that do not carry the failing URL.
+	provisionalURL string
 
-	isSizeSet         bool
-	isInitScriptAdded bool
+	isSizeSet bool
+
+	// closed is closed when this window goes away (user close or Destroy);
+	// Run() waits on it instead of re-running NSApp when the run loop already
+	// belongs to someone else. closeOnce makes the two close paths safe.
+	closed    chan struct{}
+	closeOnce sync.Once
 
 	mu             sync.Mutex
 	bindings       map[string]func(id, req string) (any, error)
 	userScriptSrcs []string
+	schemeHandlers map[string]SchemeHandler
+	// schemeHandlerObjs are the WKURLSchemeHandler delegate objects (one per
+	// scheme), kept so Destroy can drop their instance-registry entries — the
+	// engine would otherwise stay pinned in the registry after Destroy.
+	schemeHandlerObjs []objc.ID
+}
+
+// serveScheme looks up the handler for a scheme and invokes it (nil if none).
+func (w *webview) serveScheme(scheme, url string) *SchemeResponse {
+	w.mu.Lock()
+	h := w.schemeHandlers[scheme]
+	w.mu.Unlock()
+	if h == nil {
+		return nil
+	}
+	return callSchemeHandler(h, &SchemeRequest{URL: url})
 }
 
 // New creates a new window and a web view.
@@ -345,29 +727,91 @@ func New(debug bool) (WebView, error) { return NewWindow(debug, nil) }
 //
 // The first successful call pins the calling goroutine to its OS thread; keep
 // all direct UI calls on that goroutine and re-enter through Dispatch from
-// background goroutines.
+// background goroutines. Exception: when the application run loop is already
+// running (started by native/tray or another owner), NewWindow may be called
+// from any goroutine — creation and the UI-touching methods marshal
+// themselves to the main thread.
 func NewWindow(debug bool, window unsafe.Pointer) (WebView, error) {
-	if err := ensureInit(); err != nil {
+	return NewWithOptions(Options{Debug: debug, Window: window})
+}
+
+// NewWithOptions creates a web view configured by opts, including any custom
+// SchemeHandlers (which must be installed before the WKWebView is created).
+//
+// When called off the main thread while the application run loop is already
+// running (a native/tray app whose loop was started first — issue #31), the
+// creation is marshaled to the main thread and every UI-touching method of
+// the returned WebView marshals itself the same way, so the webview can be
+// driven from that goroutine.
+func NewWithOptions(opts Options) (WebView, error) {
+	err := ensureInit()
+	if err != nil {
 		return nil, err
 	}
-	uiThreadOnce.Do(runtime.LockOSThread)
+	// Before the bootstrap run: a launch to open a URL delivers it there.
+	setOpenURLs(opts.OnOpenURLs)
 
-	w := &webview{
-		ownsWindow: true,
-		debug:      debug,
-		bindings:   map[string]func(id, req string) (any, error){},
+	app := class("NSApplication").Send(sel("sharedApplication"))
+	loopRunning := app.Send(sel("isRunning")) != 0
+	uiIsMainOnce.Do(func() { uiIsMain = onMainThread() || loopRunning })
+
+	if !onMainThread() && loopRunning {
+		// Someone else's run loop is draining the main queue: build the whole
+		// webview over there. Doing it here would run AppKit off the main
+		// thread, and the old bootstrap path would hang in a second [NSApp
+		// run] waiting for an applicationDidFinishLaunching that already fired.
+		var w WebView
+		performOnMain(func() { w = newWebView(opts, app, loopRunning) })
+		return w, nil
 	}
-	w.app = class("NSApplication").Send(sel("sharedApplication"))
-	w.windowInit(objc.ID(uintptr(window)))
-	w.windowSettings(debug)
-	if w.ownsWindow && w.isInitScriptAdded {
+
+	uiThreadOnce.Do(runtime.LockOSThread)
+	return newWebView(opts, app, loopRunning), nil
+}
+
+// newWebView builds the webview on the UI thread.
+func newWebView(opts Options, app objc.ID, loopRunning bool) *webview {
+	w := &webview{
+		ownsWindow:        true,
+		debug:             opts.Debug,
+		firstMouse:        opts.AcceptsFirstMouse,
+		noBridge:          opts.NoBridge,
+		contentHidden:     opts.HideUntilLoaded,
+		onNavigation:      opts.OnNavigation,
+		onNavigationStart: opts.OnNavigationStart,
+		onURLChange:       opts.OnURLChange,
+		onContentShown:    opts.OnContentShown,
+		frameName:         opts.FrameAutosaveName,
+		onMediaCapture:    opts.OnMediaCapture,
+		onScriptDialog:    opts.OnScriptDialog,
+		navGestures:       opts.NavigationGestures,
+		onNewWindow:       opts.OnNewWindow,
+		onClose:           opts.OnClose,
+		ephemeral:         opts.Ephemeral,
+		onDownload:        opts.OnDownload,
+		onDownloadEnd:     opts.OnDownloadDone,
+		downloads:         map[objc.ID]string{},
+		bindings:          map[string]func(id, req string) (any, error){},
+		schemeHandlers:    opts.SchemeHandlers,
+		closed:            make(chan struct{}),
+	}
+	w.app = app
+	w.windowInit(objc.ID(uintptr(opts.Window)))
+	w.windowSettings(opts.Debug)
+	if loopRunning && w.ownsWindow {
+		// The loop's owner picked the activation policy (a tray app runs as
+		// Accessory, no Dock icon — leave that alone); activate so the new
+		// window actually fronts instead of opening behind the current app.
+		w.Raise()
+	}
+	if w.ownsWindow {
 		dispatchMain(func() {
 			if !w.isSizeSet {
 				w.SetSize(defaultWidth, defaultHeight, HintNone)
 			}
 		})
 	}
-	return w, nil
+	return w
 }
 
 func (w *webview) windowInit(window objc.ID) {
@@ -377,22 +821,88 @@ func (w *webview) windowInit(window objc.ID) {
 			w.ownsWindow = false
 			return
 		}
-		if !getAndSetIsFirstInstance() {
+		// The bootstrap below exists to finish launching the app: it installs
+		// an app delegate and spins a temporary [NSApp run] that the delegate
+		// stops from applicationDidFinishLaunching. If the run loop is already
+		// running (native/tray started it), the app finished launching long
+		// ago — that notification will never fire again and the temporary run
+		// would block forever. Skip straight to window creation.
+		if w.app.Send(sel("isRunning")) != 0 || !getAndSetIsFirstInstance() {
 			w.windowInitProceed()
 			return
 		}
 		w.appDelegate = objc.ID(appDelegateClass).Send(sel("new"))
 		registerInstance(w.appDelegate, w)
 		w.app.Send(sel("setDelegate:"), w.appDelegate)
+		if appFinishedLaunching() {
+			// The run loop is not running now, but it has run: something
+			// earlier in the process (a native/tray loop that has since been
+			// stopped, a dialog, a game window) finished launching the app.
+			// applicationDidFinishLaunching is delivered once per process, so
+			// the temporary run below would never be stopped and New would
+			// block forever with no window and no error. Take the path the
+			// callback would have taken, minus the stop.
+			w.finishLaunching(w.app)
+			return
+		}
 		// Temporary run loop: returns once applicationDidFinishLaunching stops it.
 		w.app.Send(sel("run"))
 	})
 }
 
-func (w *webview) onApplicationDidFinishLaunching(app objc.ID) {
-	if w.ownsWindow {
+// appFinishedLaunching reports whether AppKit has already finished launching
+// this process, and so has already delivered applicationDidFinishLaunching.
+func appFinishedLaunching() bool {
+	app := class("NSRunningApplication").Send(sel("currentApplication"))
+	if app == 0 {
+		return false
+	}
+	return app.Send(sel("isFinishedLaunching")) != 0
+}
+
+// urlWait bounds how long a launch to open a URL waits for it.
+const urlWait = 2 * time.Second
+
+func (w *webview) onApplicationDidFinishLaunching(notification objc.ID) {
+	switch {
+	case !w.ownsWindow:
+	case currentOpenURLs() != nil && !w.urlsArrived && launchedToOpen(notification):
+		// Since macOS 27 the URL a launch is for comes after this callback
+		// (before, it came first); keep the temporary loop running until it
+		// does, so OnOpenURLs still gets it before NewWithOptions returns.
+		w.awaitingURLs = true
+		time.AfterFunc(urlWait, func() { dispatchMain(w.endURLWait) })
+	default:
 		w.stopRunLoop()
 	}
+	w.finishLaunching(notification.Send(sel("object")))
+}
+
+// launchedToOpen reports a launch to open a URL or a file (or print, or run a
+// Service): NSApplicationLaunchIsDefaultLaunchKey is NO then.
+func launchedToOpen(notification objc.ID) bool {
+	info := notification.Send(sel("userInfo"))
+	if info == 0 {
+		return false
+	}
+	v := info.Send(sel("objectForKey:"), nsstr("NSApplicationLaunchIsDefaultLaunchKey"))
+	return v != 0 && !objc.Send[bool](v, sel("boolValue"))
+}
+
+// endURLWait ends the temporary loop held open by a launch to open a URL,
+// once: the URL came, or urlWait ran out.
+func (w *webview) endURLWait() {
+	if !w.awaitingURLs {
+		return
+	}
+	w.awaitingURLs = false
+	w.stopRunLoop()
+}
+
+// finishLaunching is what the delegate callback does apart from stopping the
+// temporary run loop. It is also the path taken when the app had finished
+// launching before the first web view, where there is no temporary loop.
+func (w *webview) finishLaunching(app objc.ID) {
 	if !isAppBundled() {
 		app.Send(sel("setActivationPolicy:"), nsApplicationActivationPolicyRegular)
 		app.Send(sel("activateIgnoringOtherApps:"), true)
@@ -406,7 +916,9 @@ func (w *webview) windowInitProceed() {
 		win = win.Send(sel("initWithContentRect:styleMask:backing:defer:"),
 			cgRect{cgPoint{0, 0}, cgSize{defaultWidth, defaultHeight}},
 			uint(nsWindowStyleMaskTitled), nsBackingStoreBuffered, false)
-		w.window = win.Send(sel("retain"))
+		// Destroy alone releases the +1 from alloc/init; a second release on close frees a dead object.
+		win.Send(sel("setReleasedWhenClosed:"), false)
+		w.window = win
 		w.windowDelegate = objc.ID(windowDelegateClass).Send(sel("new"))
 		registerInstance(w.windowDelegate, w)
 		w.window.Send(sel("setDelegate:"), w.windowDelegate)
@@ -428,10 +940,39 @@ func (w *webview) windowSettings(debug bool) {
 			prefs.Send(sel("setValue:forKey:"), yes, nsstr("developerExtrasEnabled"))
 		}
 		prefs.Send(sel("setValue:forKey:"), yes, nsstr("fullScreenEnabled"))
+		if w.ephemeral {
+			config.Send(sel("setWebsiteDataStore:"), class("WKWebsiteDataStore").Send(sel("nonPersistentDataStore")))
+		}
+		// macOS lets window.open run without a user gesture by default; popups
+		// must come from a click, as they do on WebKitGTK.
+		prefs.Send(sel("setJavaScriptCanOpenWindowsAutomatically:"), false)
 
-		wv := class("WKWebView").Send(sel("alloc"))
+		// Register custom scheme handlers on the configuration BEFORE the
+		// WKWebView is created — WKWebView copies its configuration at init, so
+		// this cannot be done afterward. One handler object per scheme; each is
+		// mapped back to this webview via the instance registry.
+		for scheme := range w.schemeHandlers {
+			sh := objc.ID(schemeHandlerClass).Send(sel("new"))
+			// Autorelease the +1 from -new; the configuration retains it (matching
+			// scriptHandler). Track it so Destroy can drop its registry entry.
+			sh.Send(sel("autorelease"))
+			registerInstance(sh, w)
+			w.schemeHandlerObjs = append(w.schemeHandlerObjs, sh)
+			config.Send(sel("setURLSchemeHandler:forURLScheme:"), sh, nsstr(scheme))
+		}
+
+		// The first-mouse variant is a WKWebView subclass, so everything below
+		// treats it as one; only the class allocated differs.
+		viewClass := webViewClass
+		if w.firstMouse {
+			viewClass = firstMouseViewClass
+		}
+		wv := objc.ID(viewClass).Send(sel("alloc"))
 		wv = wv.Send(sel("initWithFrame:configuration:"), rect, config)
-		w.webView = wv.Send(sel("retain"))
+		w.webView = wv
+		if w.navGestures {
+			w.webView.Send(sel("setAllowsBackForwardNavigationGestures:"), true)
+		}
 		w.webView.Send(sel("setAutoresizingMask:"), uint(nsViewWidthSizable|nsViewHeightSizable))
 		if debug {
 			w.webView.Send(sel("setInspectable:"), true)
@@ -439,25 +980,63 @@ func (w *webview) windowSettings(debug bool) {
 
 		// UIDelegate is a weak reference; keep our own strong ref in w.uiDelegate.
 		w.uiDelegate = objc.ID(uiDelegateClass).Send(sel("new"))
+		registerInstance(w.uiDelegate, w)
 		w.webView.Send(sel("setUIDelegate:"), w.uiDelegate)
 
-		handler := objc.ID(scriptHandlerClass).Send(sel("new"))
-		registerInstance(handler, w)
-		handler.Send(sel("autorelease"))
-		w.scriptHandler = handler // kept so Destroy can drop its registry entry
-		w.manager.Send(sel("addScriptMessageHandler:name:"), handler, nsstr("__webview__"))
+		if w.onDownload != nil {
+			w.downloadDelegate = objc.ID(downloadDelegateClass).Send(sel("new"))
+			registerInstance(w.downloadDelegate, w)
+		}
+		if w.contentHidden || w.onNavigation != nil || w.onNavigationStart != nil || w.onDownload != nil || w.onURLChange != nil {
+			// Weak reference too, same as the UI delegate.
+			w.navDelegate = objc.ID(navDelegateClass).Send(sel("new"))
+			registerInstance(w.navDelegate, w)
+			w.webView.Send(sel("setNavigationDelegate:"), w.navDelegate)
+		}
+		if w.onURLChange != nil {
+			w.webView.Send(sel("addObserver:forKeyPath:options:context:"), w.navDelegate, nsstr("URL"), uint(0), uintptr(0))
+		}
+		if w.contentHidden {
+			w.holdBack()
+		}
 
-		w.pushUserScript(createInitScript(bridgePostFn))
-		w.isInitScriptAdded = true
+		if !w.noBridge {
+			handler := objc.ID(scriptHandlerClass).Send(sel("new"))
+			registerInstance(handler, w)
+			handler.Send(sel("autorelease"))
+			w.scriptHandler = handler // kept so Destroy can drop its registry entry
+			w.manager.Send(sel("addScriptMessageHandler:name:"), handler, nsstr("__webview__"))
+			w.pushUserScript(createInitScript(bridgePostFn))
+		}
 
 		widget := class("NSView").Send(sel("alloc")).Send(sel("initWithFrame:"), rect)
-		w.widget = widget.Send(sel("retain"))
+		w.widget = widget
 		w.widget.Send(sel("setAutoresizesSubviews:"), true)
 		w.widget.Send(sel("addSubview:"), w.webView)
+		if w.contentHidden {
+			cover := objc.ID(paintCoverClass).Send(sel("alloc")).Send(sel("initWithFrame:"), rect)
+			cover.Send(sel("setAutoresizingMask:"), uint(nsViewWidthSizable|nsViewHeightSizable))
+			w.widget.Send(sel("addSubview:"), cover)
+			cover.Send(sel("release"))
+			w.paintCover = cover
+			w.addSpinner(rect)
+		}
 
 		w.window.Send(sel("setContentView:"), w.widget)
 		if w.ownsWindow {
 			w.window.Send(sel("makeKeyAndOrderFront:"), objc.ID(0))
+			// The content view is a plain NSView container, and a plain NSView
+			// REFUSES first-responder status — so when the window becomes key,
+			// AppKit's offer stops at the window itself and every keystroke is
+			// an unhandled key: the system beep. A click fixed it only because
+			// hit-testing hands the WKWebView the responder role. Hand it over
+			// at birth instead, so a freshly opened window types. A held-back
+			// page gets it when shown: keys must not reach a page not yet seen.
+			first := w.webView
+			if w.paintCover != 0 {
+				first = w.paintCover
+			}
+			w.window.Send(sel("makeFirstResponder:"), first)
 		}
 	})
 }
@@ -465,18 +1044,32 @@ func (w *webview) windowSettings(debug bool) {
 func (w *webview) stopRunLoop() {
 	autorelease(func() {
 		w.app.Send(sel("stop:"), objc.ID(0))
-		event := class("NSEvent").Send(
-			sel("otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
-			nsEventTypeApplicationDefined, cgPoint{0, 0}, uint(0), float64(0), 0, objc.ID(0), int16(0), 0, 0)
-		w.app.Send(sel("postEvent:atStart:"), event, true)
+		postWakeEvent(w.app)
 	})
 }
 
+// postWakeEvent posts a no-op application-defined event so a thread blocked in
+// nextEventMatchingMask wakes up (stop: alone only takes effect after an event).
+func postWakeEvent(app objc.ID) {
+	event := class("NSEvent").Send(
+		sel("otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+		nsEventTypeApplicationDefined, cgPoint{0, 0}, uint(0), float64(0), 0, objc.ID(0), int16(0), 0, 0)
+	app.Send(sel("postEvent:atStart:"), event, true)
+}
+
 func (w *webview) onWindowWillClose() {
+	if w.window == 0 {
+		return
+	}
+	// Methods ignore a gone window by its zeroed handles; the references are still owned.
+	w.closedWindow, w.closedWidget, w.closedWebView = w.window, w.widget, w.webView
+	w.spinner = 0
 	w.widget = 0
 	w.webView = 0
 	w.window = 0
+	w.closeOnce.Do(func() { close(w.closed) })
 	dispatchMain(func() { w.onWindowDestroyed(false) })
+	callClose(w.onClose)
 }
 
 func (w *webview) onWindowDestroyed(skipTermination bool) {
@@ -488,7 +1081,9 @@ func (w *webview) onWindowDestroyed(skipTermination bool) {
 		// nil and no-ops.
 		unregisterInstance(w.windowDelegate)
 	}
-	if decWindowCount() <= 0 && !skipTermination {
+	// Last owned window gone: stop the loop — but only when Run() drives it.
+	// An external owner's loop (native/tray) outlives every glaze window.
+	if decWindowCount() <= 0 && !skipTermination && glazeRunsLoop.Load() {
 		w.Terminate()
 	}
 }
@@ -504,68 +1099,333 @@ func isAppBundled() bool {
 
 // --- public API (WebView interface) ----------------------------------------
 
-func (w *webview) Run() { w.app.Send(sel("run")) }
+func (w *webview) Run() {
+	if w.app.Send(sel("isRunning")) != 0 {
+		// A run loop is already active — an external owner's (native/tray) or
+		// our own driving another window. Re-running NSApp would fight it, so
+		// Run means "until THIS window closes". Off the UI thread, waiting on
+		// the channel is enough; on it (a Run inside a tray OnClick or another
+		// run-loop callout), block-waiting would starve the loop that must
+		// deliver the close, so pump events until the window goes away.
+		if onMainThread() {
+			w.pumpUntilClosed()
+			return
+		}
+		<-w.closed
+		return
+	}
+	// The window is shown at birth, before the app has finished launching,
+	// and until then AppKit knows the main display only: a frame saved on
+	// another one could not be put there. Once the loop runs, it can.
+	if w.frameName != "" {
+		dispatchMain(func() {
+			w.applySavedFrame()
+			if os.Getenv("GLAZE_DEBUG_FRAME") != "" {
+				got := objc.Send[cgRect](w.window, sel("frame"))
+				fmt.Fprintf(os.Stderr, "glaze frame: with the loop running, window %+v\n", got)
+			}
+		})
+	}
+	glazeRunsLoop.Store(true)
+	w.app.Send(sel("run"))
+	glazeRunsLoop.Store(false)
+}
+
+// pumpUntilClosed services the event queue on the UI thread until this window
+// closes — a nested, modal-style loop for a Run() issued from inside a run-loop
+// callout (e.g. a tray menu handler).
+func (w *webview) pumpUntilClosed() {
+	for {
+		select {
+		case <-w.closed:
+			return
+		default:
+		}
+		autorelease(func() {
+			// A short wait instead of distantFuture: the close can arrive from
+			// a plain goroutine (Terminate), and a nested pump cannot count on
+			// the main dispatch queue for a wake-up — when the pump itself runs
+			// inside a main-queue callout, libdispatch will not drain that
+			// queue again until the callout returns. Polling the channel every
+			// 50ms is boring and deterministic.
+			deadline := class("NSDate").Send(sel("dateWithTimeIntervalSinceNow:"), 0.05)
+			ev := w.app.Send(sel("nextEventMatchingMask:untilDate:inMode:dequeue:"),
+				nsEventMaskAny, deadline, nsstr("kCFRunLoopDefaultMode"), true)
+			if ev != 0 {
+				w.app.Send(sel("sendEvent:"), ev)
+			}
+		})
+	}
+}
 
 // Terminate stops the run loop. Per the WebView contract it is safe to call from
 // a background thread, so the AppKit calls in stopRunLoop are routed to the main
 // thread (bindings run on goroutines), matching the Linux/Windows backends.
-func (w *webview) Terminate() { dispatchMain(w.stopRunLoop) }
+//
+// When the run loop belongs to someone else (native/tray), stopping it would
+// kill the owner's app; Terminate then only ends this webview's Run wait, and
+// the caller's Destroy closes the window.
+func (w *webview) Terminate() {
+	if w.app.Send(sel("isRunning")) != 0 && !glazeRunsLoop.Load() {
+		// Closing the channel is enough for both Run shapes: the channel wait
+		// returns at once, and the pump polls it (see pumpUntilClosed for why
+		// a queued wake-up could not be trusted here).
+		w.closeOnce.Do(func() { close(w.closed) })
+		return
+	}
+	dispatchMain(w.stopRunLoop)
+}
 
 func (w *webview) Dispatch(f func()) { dispatchMain(f) }
 
 func (w *webview) Window() unsafe.Pointer {
 	id := w.window
-	return *(*unsafe.Pointer)(unsafe.Pointer(&id))
+	return *(*unsafe.Pointer)(unsafe.Pointer(&id)) // #nosec G103 -- reinterpret the objc.ID's bits as the window pointer
 }
 
 func (w *webview) SetTitle(title string) {
-	autorelease(func() { w.window.Send(sel("setTitle:"), nsstr(title)) })
+	performOnMain(func() {
+		autorelease(func() { w.window.Send(sel("setTitle:"), nsstr(title)) })
+	})
+}
+
+func (w *webview) Focus() {
+	if w.window == 0 || w.webView == 0 {
+		return
+	}
+	// Largely redundant: an NSWindow makes its content view the first responder
+	// when it becomes key, and restores it on re-activation. Kept as the explicit,
+	// on-demand path and to mirror the other backends.
+	performOnMain(func() {
+		autorelease(func() { w.window.Send(sel("makeFirstResponder:"), w.webView) })
+	})
+}
+
+func (w *webview) Raise() {
+	if w.window == 0 {
+		return
+	}
+	performOnMain(func() {
+		autorelease(func() {
+			// Both halves are needed and neither substitutes for the other:
+			// activateIgnoringOtherApps brings the APPLICATION forward (without it
+			// the window rises inside an app that is still in the background, and
+			// the click that follows is still spent activating), and
+			// makeKeyAndOrderFront brings THIS window forward within the app.
+			w.app.Send(sel("activateIgnoringOtherApps:"), true)
+			w.window.Send(sel("makeKeyAndOrderFront:"), objc.ID(0))
+		})
+	})
 }
 
 func (w *webview) SetSize(width, height int, hint Hint) {
-	autorelease(func() {
-		style := uint(nsWindowStyleMaskTitled | nsWindowStyleMaskClosable | nsWindowStyleMaskMiniaturizable)
-		if hint != HintFixed {
-			style |= nsWindowStyleMaskResizable
-		}
-		w.window.Send(sel("setStyleMask:"), style)
-		size := cgSize{float64(width), float64(height)}
-		switch hint {
-		case HintMin:
-			w.window.Send(sel("setContentMinSize:"), size)
-		case HintMax:
-			w.window.Send(sel("setContentMaxSize:"), size)
-		default:
-			// setContentSize keeps the top-left corner fixed, avoiding a
-			// struct-return read of the current frame.
-			w.window.Send(sel("setContentSize:"), size)
-		}
-		w.window.Send(sel("center"))
+	performOnMain(func() {
+		autorelease(func() {
+			style := uint(nsWindowStyleMaskTitled | nsWindowStyleMaskClosable | nsWindowStyleMaskMiniaturizable)
+			if hint != HintFixed {
+				style |= nsWindowStyleMaskResizable
+			}
+			w.window.Send(sel("setStyleMask:"), style)
+			size := cgSize{float64(width), float64(height)}
+			switch hint {
+			case HintMin:
+				w.window.Send(sel("setContentMinSize:"), size)
+			case HintMax:
+				w.window.Send(sel("setContentMaxSize:"), size)
+			default:
+				// setContentSize keeps the top-left corner fixed, avoiding a
+				// struct-return read of the current frame.
+				w.window.Send(sel("setContentSize:"), size)
+			}
+			w.window.Send(sel("center"))
+			if !w.isSizeSet && w.frameName != "" {
+				w.restoreFrame()
+			}
+		})
 	})
 	w.isSizeSet = true
 }
+
+// restoreFrame takes the frame saved under frameName, if any. A window opened
+// alone keeps it saved from then on; one opened beside other running instances
+// of this app (each its own process, all opening on the same spot) steps clear
+// of them and saves nothing, or every launch would drift further.
+func (w *webview) restoreFrame() {
+	name := nsstr(w.frameName)
+	others := 0
+	id := class("NSBundle").Send(sel("mainBundle")).Send(sel("bundleIdentifier"))
+	if id != 0 {
+		running := class("NSRunningApplication").Send(sel("runningApplicationsWithBundleIdentifier:"), id)
+		others = objc.Send[int](running, sel("count")) - 1
+	}
+	if others <= 0 {
+		// Setting the autosave name restores the saved frame too, AppKit's
+		// way, so it goes before the placement below, which has the last word.
+		w.window.Send(sel("setFrameAutosaveName:"), name)
+	}
+	// setFrameUsingName: fits the saved frame to the screen the window is
+	// on, and a window not yet shown is on none, which AppKit takes as the
+	// main one: a frame saved on another display came back to the main
+	// one. So the saved frame is applied as it is when a display still
+	// holds it, and AppKit's way is the fallback (a display unplugged).
+	if !w.applySavedFrame() {
+		w.window.Send(sel("setFrameUsingName:"), name)
+	}
+	if others <= 0 {
+		return
+	}
+	const step, steps = 24, 8
+	f := objc.Send[cgRect](w.window, sel("frame"))
+	off := float64(others%steps) * step
+	w.window.Send(sel("setFrameTopLeftPoint:"), cgPoint{f.Origin.X + off, f.Origin.Y + f.Size.Height - off})
+}
+
+// applySavedFrame puts the window at the frame saved under frameName ("x y
+// w h sx sy sw sh", the window's then the screen's) when that frame still
+// overlaps a screen; false when nothing usable is saved.
+func (w *webview) applySavedFrame() bool {
+	debug := os.Getenv("GLAZE_DEBUG_FRAME") != ""
+	defaults := class("NSUserDefaults").Send(sel("standardUserDefaults"))
+	saved := defaults.Send(sel("stringForKey:"), nsstr("NSWindow Frame "+w.frameName))
+	if saved == 0 {
+		if debug {
+			fmt.Fprintf(os.Stderr, "glaze frame: nothing saved under %q\n", w.frameName)
+		}
+		return false
+	}
+	text := cstr(saved.Send(sel("UTF8String")))
+	var x, y, width, height float64
+	n, err := fmt.Sscan(text, &x, &y, &width, &height)
+	if debug {
+		fmt.Fprintf(os.Stderr, "glaze frame: saved %q -> %d fields, err %v\n", text, n, err)
+	}
+	if err != nil || n != 4 || width <= 0 || height <= 0 {
+		return false
+	}
+	frame := cgRect{cgPoint{x, y}, cgSize{width, height}}
+	screens := class("NSScreen").Send(sel("screens"))
+	count := objc.Send[int](screens, sel("count"))
+	for i := range count {
+		screen := objc.Send[cgRect](screens.Send(sel("objectAtIndex:"), i), sel("frame"))
+		if debug {
+			fmt.Fprintf(os.Stderr, "glaze frame: screen %d %+v overlaps %v\n", i, screen, overlaps(frame, screen))
+		}
+		if overlaps(frame, screen) {
+			w.window.Send(sel("setFrame:display:"), frame, true)
+			if debug {
+				got := objc.Send[cgRect](w.window, sel("frame"))
+				fmt.Fprintf(os.Stderr, "glaze frame: applied %+v, window now %+v\n", frame, got)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// overlaps is true when the rects share some area: a window whose saved
+// frame is entirely off every display is not worth restoring there.
+func overlaps(a, b cgRect) bool {
+	return a.Origin.X < b.Origin.X+b.Size.Width && b.Origin.X < a.Origin.X+a.Size.Width &&
+		a.Origin.Y < b.Origin.Y+b.Size.Height && b.Origin.Y < a.Origin.Y+a.Size.Height
+}
+
+// send runs a no-argument WKWebView method on the main thread.
+func (w *webview) send(selector string) {
+	performOnMain(func() {
+		if w.webView != 0 {
+			w.webView.Send(sel(selector))
+		}
+	})
+}
+
+func (w *webview) Find(text string, backwards bool, done func(bool)) {
+	performOnMain(func() {
+		if w.webView == 0 || text == "" {
+			callFind(done, false)
+			return
+		}
+		autorelease(func() {
+			cfg := class("WKFindConfiguration").Send(sel("new"))
+			cfg.Send(sel("autorelease"))
+			cfg.Send(sel("setBackwards:"), backwards)
+			// WebKit copies the block; this reference is released below.
+			block := objc.NewBlock(func(_ objc.Block, result objc.ID) {
+				callFind(done, objc.Send[bool](result, sel("matchFound")))
+			})
+			w.webView.Send(sel("findString:withConfiguration:completionHandler:"), nsstr(text), cfg, block)
+			block.Release()
+		})
+	})
+}
+
+func (w *webview) SetZoom(factor float64) {
+	performOnMain(func() {
+		if w.webView != 0 {
+			w.webView.Send(sel("setPageZoom:"), factor)
+		}
+	})
+}
+
+func (w *webview) GoBack()    { w.send("goBack") }
+func (w *webview) GoForward() { w.send("goForward") }
+func (w *webview) Reload()    { w.send("reload") }
+func (w *webview) Stop()      { w.send("stopLoading") }
 
 func (w *webview) Navigate(url string) {
 	if url == "" {
 		url = "about:blank"
 	}
-	autorelease(func() {
-		nsurl := class("NSURL").Send(sel("URLWithString:"), nsstr(url))
-		req := class("NSURLRequest").Send(sel("requestWithURL:"), nsurl)
-		w.webView.Send(sel("loadRequest:"), req)
+	performOnMain(func() {
+		autorelease(func() {
+			nsurl := class("NSURL").Send(sel("URLWithString:"), nsstr(url))
+			w.loadStarted()
+			scope, isDir, ok := localPageScope(url)
+			if ok {
+				// loadRequest: lets a local page read anything the app can,
+				// and under the sandbox nothing at all; this keeps the page
+				// to its own directory and hands the content process the
+				// extension to read it.
+				readable := class("NSURL").Send(sel("fileURLWithPath:isDirectory:"), nsstr(scope), isDir)
+				w.webView.Send(sel("loadFileURL:allowingReadAccessToURL:"), nsurl, readable)
+				return
+			}
+			req := class("NSURLRequest").Send(sel("requestWithURL:"), nsurl)
+			w.webView.Send(sel("loadRequest:"), req)
+		})
 	})
 }
 
+// localPageScope is what a file: page may read: its directory, or just the
+// file when the directory is out of reach -- a sandboxed app handed one file
+// by the system (Open With, open -a) has exactly that file.
+func localPageScope(raw string) (scope string, isDir, ok bool) {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Scheme != "file" || u.Path == "" {
+		return "", false, false
+	}
+	dir := filepath.Dir(u.Path)
+	d, err := os.Open(dir) // #nosec G304 -- the page's own directory, only probed for access
+	if err != nil {
+		return u.Path, false, true
+	}
+	_ = d.Close()
+	return dir, true, true
+}
+
 func (w *webview) SetHtml(html string) {
-	autorelease(func() {
-		w.webView.Send(sel("loadHTMLString:baseURL:"), nsstr(html), objc.ID(0))
+	performOnMain(func() {
+		autorelease(func() {
+			w.webView.Send(sel("loadHTMLString:baseURL:"), nsstr(html), objc.ID(0))
+		})
 	})
 }
 
 func (w *webview) Init(js string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.pushUserScript(js)
+	performOnMain(func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.pushUserScript(js)
+	})
 }
 
 func (w *webview) Eval(js string) {
@@ -576,37 +1436,62 @@ func (w *webview) Eval(js string) {
 	// loadHTMLString with a nil baseURL, which leaves WKWebView.URL nil, so such a
 	// guard would block every Eval on SetHtml pages. Evaluating before load is
 	// harmless on WKWebView (the completion handler, which we ignore, just errors).
-	autorelease(func() {
-		w.webView.Send(sel("evaluateJavaScript:completionHandler:"), nsstr(js), objc.ID(0))
+	performOnMain(func() {
+		autorelease(func() {
+			w.webView.Send(sel("evaluateJavaScript:completionHandler:"), nsstr(js), objc.ID(0))
+		})
 	})
 }
 
 func (w *webview) Bind(name string, f any) error {
+	if w.noBridge {
+		return ErrBridgeDisabled
+	}
 	wrapper, err := makeFuncWrapper(f)
 	if err != nil {
 		return err
 	}
-	w.mu.Lock()
-	if _, exists := w.bindings[name]; exists {
-		w.mu.Unlock()
-		return errors.New("function name already bound")
+	// The script rebuild touches the WKUserContentController, so it runs on the
+	// UI thread; taking mu inside the marshaled closure keeps every mu+AppKit
+	// section on one thread (no lock held across a thread hop).
+	var bindErr error
+	performOnMain(func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		_, exists := w.bindings[name]
+		if exists {
+			bindErr = errors.New("function name already bound")
+			return
+		}
+		w.bindings[name] = wrapper
+		w.rebuildScriptsLocked()
+	})
+	if bindErr != nil {
+		return bindErr
 	}
-	w.bindings[name] = wrapper
-	w.rebuildScriptsLocked()
-	w.mu.Unlock()
 	w.Eval(fmt.Sprintf("if(window.__webview__){window.__webview__.onBind(%s)}", marshalJSON(name)))
 	return nil
 }
 
 func (w *webview) Unbind(name string) error {
-	w.mu.Lock()
-	if _, exists := w.bindings[name]; !exists {
-		w.mu.Unlock()
-		return errors.New("function name not bound")
+	if w.noBridge {
+		return ErrBridgeDisabled
 	}
-	delete(w.bindings, name)
-	w.rebuildScriptsLocked()
-	w.mu.Unlock()
+	var unbindErr error
+	performOnMain(func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		_, exists := w.bindings[name]
+		if !exists {
+			unbindErr = errors.New("function name not bound")
+			return
+		}
+		delete(w.bindings, name)
+		w.rebuildScriptsLocked()
+	})
+	if unbindErr != nil {
+		return unbindErr
+	}
 	w.Eval(fmt.Sprintf("if(window.__webview__){window.__webview__.onUnbind(%s)}", marshalJSON(name)))
 	return nil
 }
@@ -614,31 +1499,45 @@ func (w *webview) Unbind(name string) error {
 // Destroy releases the web view and closes the native window, mirroring
 // webview's cocoa destructor (release order matters for AppKit/WebKit).
 func (w *webview) Destroy() {
-	autorelease(func() {
-		if w.window != 0 {
-			if w.webView != 0 {
-				if w.uiDelegate != 0 {
-					w.webView.Send(sel("setUIDelegate:"), objc.ID(0))
-					w.uiDelegate.Send(sel("release"))
-					w.uiDelegate = 0
-				}
-				w.webView.Send(sel("release"))
-				w.webView = 0
-			}
-			if w.widget != 0 {
-				if w.widget == w.window.Send(sel("contentView")) {
-					w.window.Send(sel("setContentView:"), objc.ID(0))
-				}
-				w.widget.Send(sel("release"))
-				w.widget = 0
-			}
-			if w.ownsWindow {
-				w.window.Send(sel("setDelegate:"), objc.ID(0))
-				w.window.Send(sel("close"))
-				w.onWindowDestroyed(true)
-			}
-			w.window = 0
+	performOnMain(func() { w.destroyOnUI() })
+}
+
+func (w *webview) releaseWindow() {
+	userClosed := w.window == 0 && w.closedWindow != 0
+	if userClosed {
+		w.window, w.widget, w.webView = w.closedWindow, w.closedWidget, w.closedWebView
+		w.closedWindow, w.closedWidget, w.closedWebView = 0, 0, 0
+	}
+	if w.window == 0 {
+		return
+	}
+	if w.webView != 0 {
+		w.releaseWebViewDelegates()
+		w.webView.Send(sel("release"))
+		w.webView = 0
+	}
+	w.spinner = 0 // released with widget
+	if w.widget != 0 {
+		if w.widget == w.window.Send(sel("contentView")) {
+			w.window.Send(sel("setContentView:"), objc.ID(0))
 		}
+		w.widget.Send(sel("release"))
+		w.widget = 0
+	}
+	if w.ownsWindow {
+		w.window.Send(sel("setDelegate:"), objc.ID(0))
+		if !userClosed {
+			w.window.Send(sel("close"))
+			w.onWindowDestroyed(true)
+		}
+		w.window.Send(sel("release"))
+	}
+	w.window = 0
+}
+
+func (w *webview) destroyOnUI() {
+	autorelease(func() {
+		w.releaseWindow()
 		if w.windowDelegate != 0 {
 			unregisterInstance(w.windowDelegate)
 			w.windowDelegate.Send(sel("release"))
@@ -656,8 +1555,30 @@ func (w *webview) Destroy() {
 			unregisterInstance(w.scriptHandler)
 			w.scriptHandler = 0
 		}
+		if w.paintHandler != 0 {
+			unregisterInstance(w.paintHandler) // owned by the manager, like scriptHandler
+			w.paintHandler = 0
+		}
+		if w.paintWorld != 0 {
+			w.paintWorld.Send(sel("release"))
+			w.paintWorld = 0
+		}
+		w.paintCover = 0 // released with widget
+		// Scheme-handler delegates are owned by the (now-released) configuration;
+		// like scriptHandler, only their registry entries need reclaiming.
+		for _, sh := range w.schemeHandlerObjs {
+			unregisterInstance(sh)
+		}
+		w.schemeHandlerObjs = nil
 	})
-	if w.ownsWindow {
+	// Unblock a Run() waiting on this window (the pump polls the channel).
+	w.closeOnce.Do(func() { close(w.closed) })
+	if w.ownsWindow && !glazeRunsLoop.Load() && w.app.Send(sel("isRunning")) == 0 {
+		// No run loop is active (the normal teardown, after Run returned):
+		// flush the events queued during destruction ourselves. When a loop IS
+		// running — ours or an external owner's — it drains them, and pumping
+		// nested from inside one of its callouts is exactly the kind of
+		// re-entrancy to avoid.
 		w.depleteRunLoopEventQueue()
 	}
 }
@@ -703,6 +1624,7 @@ func (w *webview) rebuildScriptsLocked() {
 			addWKUserScript(w.manager, src)
 		}
 		addWKUserScript(w.manager, createBindScript(w.bindingNamesLocked()))
+		w.addPaintScript()
 	})
 }
 
@@ -728,7 +1650,8 @@ func (w *webview) onMessage(body string) {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
 	}
-	if err := json.Unmarshal([]byte(body), &m); err != nil {
+	err := json.Unmarshal([]byte(body), &m)
+	if err != nil {
 		return
 	}
 	w.mu.Lock()
@@ -747,4 +1670,438 @@ func (w *webview) resolve(id string, status int, resultJSON string) {
 	js := fmt.Sprintf("window.__webview__.onReply(%s, %d, %s)",
 		marshalJSON(id), status, marshalJSON(resultJSON))
 	dispatchMain(func() { autorelease(func() { w.Eval(js) }) })
+}
+
+// releaseWebViewDelegates detaches and releases the delegates WKWebView holds
+// only weakly (the strong references live on w).
+func (w *webview) releaseWebViewDelegates() {
+	if w.navDelegate != 0 {
+		if w.onURLChange != nil {
+			w.webView.Send(sel("removeObserver:forKeyPath:"), w.navDelegate, nsstr("URL"))
+		}
+		w.webView.Send(sel("setNavigationDelegate:"), objc.ID(0))
+		unregisterInstance(w.navDelegate)
+		w.navDelegate.Send(sel("release"))
+		w.navDelegate = 0
+	}
+	if w.downloadDelegate != 0 {
+		unregisterInstance(w.downloadDelegate)
+		w.downloadDelegate.Send(sel("release"))
+		w.downloadDelegate = 0
+	}
+	if w.uiDelegate != 0 {
+		w.webView.Send(sel("setUIDelegate:"), objc.ID(0))
+		unregisterInstance(w.uiDelegate)
+		w.uiDelegate.Send(sel("release"))
+		w.uiDelegate = 0
+	}
+}
+
+// addSpinner centers a spinner over the held-back web view. It shows after
+// spinnerDelay, so a slow first page does not look like a window that is
+// doing nothing.
+func (w *webview) addSpinner(bounds cgRect) {
+	const size = 32
+	frame := cgRect{cgPoint{(bounds.Size.Width - size) / 2, (bounds.Size.Height - size) / 2}, cgSize{size, size}}
+	s := class("NSProgressIndicator").Send(sel("alloc")).Send(sel("initWithFrame:"), frame)
+	s.Send(sel("setStyle:"), nsProgressIndicatorStyleSpinning)
+	s.Send(sel("setIndeterminate:"), true)
+	s.Send(sel("setHidden:"), true)
+	s.Send(sel("setAutoresizingMask:"), uint(nsViewMinXMargin|nsViewMaxXMargin|nsViewMinYMargin|nsViewMaxYMargin))
+	w.widget.Send(sel("addSubview:"), s)
+	s.Send(sel("release"))
+	w.spinner = s
+	time.AfterFunc(spinnerDelay, func() {
+		dispatchMain(func() {
+			if w.spinner != 0 {
+				w.spinner.Send(sel("setHidden:"), false)
+				w.spinner.Send(sel("startAnimation:"), objc.ID(0))
+			}
+		})
+	})
+}
+
+// revealContent shows a web view held back by HideUntilLoaded, once. It runs
+// from navigation delegate callbacks, so already on the main thread.
+func (w *webview) revealContent() {
+	if !w.contentHidden || w.webView == 0 {
+		return
+	}
+	w.contentHidden = false
+	if w.spinner != 0 {
+		w.spinner.Send(sel("removeFromSuperview"))
+		w.spinner = 0
+	}
+	if w.paintCover != 0 {
+		w.paintCover.Send(sel("removeFromSuperview"))
+		w.paintCover = 0
+	}
+	w.webView.Send(sel("setAlphaValue:"), float64(1))
+	w.window.Send(sel("makeFirstResponder:"), w.webView)
+	callShown(w.onContentShown)
+}
+
+// paintScript tells glaze when a held-back page first paints, two frames
+// later so the paint is on screen, or 150 ms later if frames stop (a display
+// that is not refreshing pauses them; the page would wait for the finish).
+// It runs in a content world of its own: the page cannot reach the handler,
+// and it posts nothing but the signal.
+const paintScript = `(function(){try{new PerformanceObserver(function(l,o){` +
+	`if(!l.getEntriesByName("first-contentful-paint").length)return;o.disconnect();` +
+	`var sent=false;function post(){if(sent)return;sent=true;webkit.messageHandlers.glazePaint.postMessage(0)}` +
+	`requestAnimationFrame(function(){requestAnimationFrame(post)});setTimeout(post,150)` +
+	`}).observe({type:"paint",buffered:true})}catch(e){}})()`
+
+// holdBack keeps the web view out of sight until its page first paints, or
+// the navigation ends. Transparent rather than hidden: WebKit hands a hidden
+// view's paint to the screen only once it is shown, a white frame or two, and
+// stops its animation frames. Without WKContentWorld (before macOS 11) the
+// page shows when the navigation ends.
+func (w *webview) holdBack() {
+	w.webView.Send(sel("setAlphaValue:"), float64(0))
+	worldClass := class("WKContentWorld")
+	if worldClass == 0 {
+		return
+	}
+	w.paintWorld = worldClass.Send(sel("worldWithName:"), nsstr("glaze-paint")).Send(sel("retain"))
+	w.paintHandler = objc.ID(paintHandlerClass).Send(sel("new"))
+	registerInstance(w.paintHandler, w)
+	w.manager.Send(sel("addScriptMessageHandler:contentWorld:name:"), w.paintHandler, w.paintWorld, nsstr("glazePaint"))
+	w.paintHandler.Send(sel("release")) // the content manager holds it now
+	w.addPaintScript()
+}
+
+func (w *webview) addPaintScript() {
+	if w.paintWorld == 0 || !w.contentHidden {
+		return
+	}
+	s := class("WKUserScript").Send(sel("alloc")).Send(sel("initWithSource:injectionTime:forMainFrameOnly:inContentWorld:"),
+		nsstr(paintScript), wkInjectionTimeAtDocumentStart, true, w.paintWorld)
+	w.manager.Send(sel("addUserScript:"), s)
+	s.Send(sel("release"))
+}
+
+// navigationEvent builds the report for a navigation that ended on wv; nsErr
+// is the NSError of a failure, or 0. A provisional failure never committed,
+// so wv still holds the previous page: the URL comes from the error, else
+// from the provisional target (WebKit's own errors carry no failing URL).
+func navigationEvent(wv, nsErr objc.ID, provisionalURL string) NavigationEvent {
+	if nsErr == 0 {
+		return NavigationEvent{Kind: NavigationFinished, URL: absoluteString(wv.Send(sel("URL")))}
+	}
+	ev := NavigationEvent{Kind: NavigationFailed,
+		Err: errors.New(cstr(nsErr.Send(sel("localizedDescription")).Send(sel("UTF8String")))),
+		TLS: isTLSError(nsErr)}
+	info := nsErr.Send(sel("userInfo"))
+	ev.URL = absoluteString(info.Send(sel("objectForKey:"), nsstr("NSErrorFailingURLKey")))
+	if ev.URL == "" {
+		ev.URL = cstr(info.Send(sel("objectForKey:"), nsstr("NSErrorFailingURLStringKey")).Send(sel("UTF8String")))
+	}
+	if ev.URL == "" {
+		ev.URL = provisionalURL
+	}
+	return ev
+}
+
+func absoluteString(nsurl objc.ID) string {
+	if nsurl == 0 {
+		return ""
+	}
+	return cstr(nsurl.Send(sel("absoluteString")).Send(sel("UTF8String")))
+}
+
+func nsErrorCode(nsErr objc.ID) (string, int) {
+	return cstr(nsErr.Send(sel("domain")).Send(sel("UTF8String"))), objc.Send[int](nsErr, sel("code"))
+}
+
+// NSURLErrorSecureConnectionFailed (-1200) through
+// NSURLErrorClientCertificateRequired (-1206).
+func isTLSError(nsErr objc.ID) bool {
+	domain, code := nsErrorCode(nsErr)
+	return domain == "NSURLErrorDomain" && code <= -1200 && code >= -1206
+}
+
+// NSURLErrorCancelled (-999): another navigation replaced this one.
+// WebKitErrorFrameLoadInterruptedByPolicyChange (102): the response became a
+// download, or a policy decision stopped it.
+func isCancelled(nsErr objc.ID) bool {
+	domain, code := nsErrorCode(nsErr)
+	return domain == "NSURLErrorDomain" && code == -999 ||
+		domain == "WebKitErrorDomain" && code == 102
+}
+
+// WKMediaCaptureType (camera, microphone, both) and WKPermissionDecision
+// (0 is "ask the user", never used: the app decides).
+const (
+	wkMediaCaptureCamera     = 0
+	wkMediaCaptureMicrophone = 1
+
+	wkPermissionGrant = 1
+	wkPermissionDeny  = 2
+)
+
+// securityOrigin renders a WKSecurityOrigin as scheme://host[:port].
+func securityOrigin(o objc.ID) string {
+	if o == 0 {
+		return ""
+	}
+	origin := cstr(o.Send(sel("protocol")).Send(sel("UTF8String"))) + "://" +
+		cstr(o.Send(sel("host")).Send(sel("UTF8String")))
+	port := objc.Send[int](o, sel("port"))
+	if port != 0 {
+		origin += fmt.Sprintf(":%d", port)
+	}
+	return origin
+}
+
+// WKNavigationActionPolicy / WKNavigationResponsePolicy: 1 allow, 2 download.
+const (
+	wkPolicyAllow    = 1
+	wkPolicyDownload = 2
+)
+
+// isDownloadResponse: a response the view cannot show, or one the server
+// marks as an attachment, is saved rather than displayed.
+func isDownloadResponse(response objc.ID) bool {
+	if !objc.Send[bool](response, sel("canShowMIMEType")) {
+		return true
+	}
+	r := response.Send(sel("response"))
+	if !objc.Send[bool](r, sel("isKindOfClass:"), class("NSHTTPURLResponse")) {
+		return false
+	}
+	cd := strings.ToLower(cstr(r.Send(sel("valueForHTTPHeaderField:"), nsstr("Content-Disposition")).Send(sel("UTF8String"))))
+	return strings.HasPrefix(strings.TrimSpace(cd), "attachment")
+}
+
+// isDownloadAction: a link with the download attribute.
+func isDownloadAction(action objc.ID) bool {
+	return objc.Send[bool](action, sel("respondsToSelector:"), sel("shouldPerformDownload")) &&
+		objc.Send[bool](action, sel("shouldPerformDownload"))
+}
+
+func adoptDownload(navDelegate, download objc.ID) {
+	w := lookupEngine(navDelegate)
+	if w == nil || w.downloadDelegate == 0 {
+		download.Send(sel("cancel:"), objc.ID(0))
+		return
+	}
+	// The delegate property is weak; w.downloadDelegate holds it.
+	download.Send(sel("setDelegate:"), w.downloadDelegate)
+}
+
+// decideDownloadDestination asks the app for a path outside WebKit's
+// callback (the app may run a modal save panel), then answers WebKit.
+func decideDownloadDestination(self objc.ID, _cmd objc.SEL, download, response, suggested, completion objc.ID) {
+	w := lookupEngine(self)
+	name := cstr(suggested.Send(sel("UTF8String")))
+	done := objc.Block(completion).Copy()
+	dispatchMain(func() {
+		defer done.Release()
+		var dest objc.ID
+		path := ""
+		if w != nil {
+			path = callDownload(w.onDownload, name)
+		}
+		if path != "" {
+			// The user confirmed the path, overwrite included; WKDownload
+			// refuses a destination that already exists.
+			_ = os.Remove(path)
+			w.downloads[download] = path
+			dest = class("NSURL").Send(sel("fileURLWithPath:"), nsstr(path))
+		}
+		invokeNativeBlock(objc.ID(done), "v@?@", unsafe.Pointer(&dest)) // #nosec G103 -- the arg's address, for NSInvocation
+	})
+}
+
+func downloadEnded(self, download objc.ID, err error) {
+	w := lookupEngine(self)
+	if w == nil {
+		return
+	}
+	path, ok := w.downloads[download]
+	if !ok {
+		return // cancelled before it had a destination
+	}
+	delete(w.downloads, download)
+	callDownloadDone(w.onDownloadEnd, path, err)
+}
+
+func nsURLStrings(urls objc.ID) []string {
+	n := objc.Send[uint](urls, sel("count"))
+	out := make([]string, 0, n)
+	for i := range n {
+		out = append(out, absoluteString(urls.Send(sel("objectAtIndex:"), i)))
+	}
+	return out
+}
+
+// Opening URLs is an application event, not a window's: glaze installs its
+// app delegate once, with the first web view, and later web views have none of
+// their own. The handler therefore lives here; the last NewWithOptions that
+// passes one wins.
+var (
+	openURLsMu      sync.Mutex
+	openURLsHandler func([]string)
+)
+
+func setOpenURLs(f func([]string)) {
+	if f == nil {
+		return
+	}
+	openURLsMu.Lock()
+	openURLsHandler = f
+	openURLsMu.Unlock()
+}
+
+func currentOpenURLs() func([]string) {
+	openURLsMu.Lock()
+	defer openURLsMu.Unlock()
+	return openURLsHandler
+}
+
+// callOpenURLs runs the app's handler with panic containment, like
+// callNavigation.
+func callOpenURLs(f func([]string), urls []string) {
+	if f == nil || len(urls) == 0 {
+		return
+	}
+	defer func() { _ = recover() }()
+	f(urls)
+}
+
+// registerNavigationClasses registers the navigation and download delegates.
+func registerNavigationClasses() error {
+	var err error
+	// Every way a navigation ends reveals a view held back by HideUntilLoaded
+	// and is reported to OnNavigation.
+	ended := func(self, wv, nsErr objc.ID) {
+		w := lookupEngine(self)
+		if w == nil {
+			return
+		}
+		w.loadEnded()
+		w.revealContent()
+		if nsErr != 0 && isCancelled(nsErr) {
+			return
+		}
+		callNavigation(w.onNavigation, navigationEvent(wv, nsErr, w.provisionalURL))
+	}
+	// While a navigation is provisional, wv.URL is its target; after a
+	// provisional failure it reverts to the previous page, so remember it now.
+	// A redirect moves the target of the same navigation: not a new start.
+	provisional := func(self, wv objc.ID, started bool) {
+		w := lookupEngine(self)
+		if w == nil {
+			return
+		}
+		w.provisionalURL = absoluteString(wv.Send(sel("URL")))
+		if started {
+			w.loadStarted()
+			callURL(w.onNavigationStart, w.provisionalURL)
+		}
+	}
+	navDelegateClass, err = objc.RegisterClass(
+		"GlazeNavigationDelegate", objc.GetClass("NSObject"),
+		[]*objc.Protocol{objc.GetProtocol("WKNavigationDelegate")}, nil,
+		[]objc.MethodDef{
+			{
+				Cmd: sel("webView:didStartProvisionalNavigation:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, nav objc.ID) { provisional(self, wv, true) },
+			},
+			{
+				Cmd: sel("webView:didReceiveServerRedirectForProvisionalNavigation:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, nav objc.ID) { provisional(self, wv, false) },
+			},
+			{
+				Cmd: sel("webView:decidePolicyForNavigationResponse:decisionHandler:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, response, handler objc.ID) {
+					policy := int64(wkPolicyAllow)
+					w := lookupEngine(self)
+					if w != nil && w.onDownload != nil && isDownloadResponse(response) {
+						policy = wkPolicyDownload
+					}
+					invokeNativeBlock(handler, "v@?q", unsafe.Pointer(&policy)) // #nosec G103 -- the arg's address, for NSInvocation
+				},
+			},
+			{
+				Cmd: sel("webView:decidePolicyForNavigationAction:decisionHandler:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, action, handler objc.ID) {
+					policy := int64(wkPolicyAllow)
+					w := lookupEngine(self)
+					if w != nil && w.onDownload != nil && isDownloadAction(action) {
+						policy = wkPolicyDownload
+					}
+					invokeNativeBlock(handler, "v@?q", unsafe.Pointer(&policy)) // #nosec G103 -- the arg's address, for NSInvocation
+				},
+			},
+			{
+				Cmd: sel("webView:navigationResponse:didBecomeDownload:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, response, download objc.ID) { adoptDownload(self, download) },
+			},
+			{
+				Cmd: sel("webView:navigationAction:didBecomeDownload:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, action, download objc.ID) { adoptDownload(self, download) },
+			},
+			{
+				Cmd: sel("webView:didFinishNavigation:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, nav objc.ID) { ended(self, wv, 0) },
+			},
+			{
+				Cmd: sel("webView:didFailNavigation:withError:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, nav, err objc.ID) { ended(self, wv, err) },
+			},
+			{
+				Cmd: sel("webView:didFailProvisionalNavigation:withError:"),
+				Fn:  func(self objc.ID, _cmd objc.SEL, wv, nav, err objc.ID) { ended(self, wv, err) },
+			},
+			{
+				Cmd: sel("webView:didCommitNavigation:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, wv, nav objc.ID) {
+					w := lookupEngine(self)
+					if w != nil {
+						w.loadCommitted(absoluteString(wv.Send(sel("URL"))))
+					}
+				},
+			},
+			{
+				// KVO of the web view's URL.
+				Cmd: sel("observeValueForKeyPath:ofObject:change:context:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, keyPath, wv, change objc.ID, context uintptr) {
+					w := lookupEngine(self)
+					if w != nil {
+						w.urlChanged(absoluteString(wv.Send(sel("URL"))), objc.Send[bool](wv, sel("isLoading")))
+					}
+				},
+			},
+		})
+	if err != nil {
+		return fmt.Errorf("webview: navigation delegate class: %w", err)
+	}
+
+	downloadDelegateClass, err = objc.RegisterClass(
+		"GlazeDownloadDelegate", objc.GetClass("NSObject"),
+		[]*objc.Protocol{objc.GetProtocol("WKDownloadDelegate")}, nil,
+		[]objc.MethodDef{
+			{
+				Cmd: sel("download:decideDestinationUsingResponse:suggestedFilename:completionHandler:"),
+				Fn:  decideDownloadDestination,
+			},
+			{
+				Cmd: sel("downloadDidFinish:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, download objc.ID) {
+					downloadEnded(self, download, nil)
+				},
+			},
+			{
+				Cmd: sel("download:didFailWithError:resumeData:"),
+				Fn: func(self objc.ID, _cmd objc.SEL, download, nsErr, resume objc.ID) {
+					downloadEnded(self, download, errors.New(cstr(nsErr.Send(sel("localizedDescription")).Send(sel("UTF8String")))))
+				},
+			},
+		})
+	if err != nil {
+		return fmt.Errorf("webview: download delegate class: %w", err)
+	}
+	return nil
 }

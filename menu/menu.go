@@ -1,0 +1,125 @@
+// Package menu builds native application menus without cgo.
+//
+// It is a standalone package: it depends only on purego (and the Objective-C
+// runtime on macOS), not on glaze's WebView. Any app with a native run loop can
+// install a menu bar — a glaze window, an Ebitengine game, or a bare
+// NSApplication. glaze is one consumer, not a requirement.
+//
+//	menu.Set([]menu.Item{
+//		{Title: "App", Submenu: []menu.Item{
+//			{Title: "About", OnClick: showAbout},
+//			{Separator: true},
+//			{Title: "Quit", Shortcut: "cmd+q", OnClick: quit},
+//		}},
+//		{Title: "Edit", Submenu: []menu.Item{
+//			{Title: "Copy", Shortcut: "cmd+c", OnClick: copy},
+//		}},
+//	}, menu.Options{})
+//
+// Platform support: macOS (NSMenu) and Windows (a Win32 menu bar attached to the
+// caller's window, without shortcuts). Linux draws no bar -- the GTK3/GTK4
+// menu-bar story is too fragmented to do cheaply -- but installs the items'
+// shortcuts on Options.Window, cmd read as ctrl.
+package menu
+
+import (
+	"errors"
+	"fmt"
+	"unsafe"
+)
+
+// ErrUnsupported is returned by Set on a platform with no menu backend.
+//
+// It wraps the standard errors.ErrUnsupported, so an application that also
+// uses other optional-capability packages can test them all with one errors.Is
+// rather than importing each one to name its sentinel. errors.Is against this
+// variable still matches, as before.
+var ErrUnsupported = fmt.Errorf("menu: not supported on this platform: %w", errors.ErrUnsupported)
+
+// Item is one entry in a menu. A zero Item with Separator=true is a divider; an
+// Item with a non-empty Submenu is a sub-menu (its OnClick is ignored).
+type Item struct {
+	// Title is the visible label. On macOS the first top-level item is the
+	// application menu and its title is replaced by the app name.
+	Title string
+
+	// Shortcut is an optional accelerator like "cmd+q" or "cmd+shift+z". The
+	// modifiers are cmd, ctrl, alt (a.k.a. opt) and shift; the last token is the
+	// key. Empty means no shortcut.
+	Shortcut string
+
+	// OnClick is invoked when the item is chosen. It runs on the UI thread (see
+	// Options.Dispatch). Ignored for separators and items that have a Submenu.
+	OnClick func()
+
+	// Selector, macOS only, wires the item to a native Objective-C action sent
+	// down the responder chain (nil target) instead of a Go callback: "undo:",
+	// "redo:", "cut:", "copy:", "paste:", "selectAll:" build a standard Edit
+	// menu whose shortcuts reach the focused view, a WKWebView included; without
+	// them Cmd+C/V/X have no route to the web view's editing commands. An item
+	// with a Selector ignores OnClick. On Windows and Linux the item is skipped:
+	// there the focused control handles editing shortcuts itself, so the menu
+	// has nothing to wire.
+	Selector string
+
+	// Services, macOS only, makes this item the system Services menu: AppKit
+	// fills it with the services that can take the current selection (look up,
+	// open as a note, and so on), the focused WKWebView's included. Submenu
+	// and OnClick are ignored. Elsewhere the item is skipped: no such menu.
+	Services bool
+
+	// Submenu, when non-empty, makes this item open a sub-menu.
+	Submenu []Item
+
+	// Separator makes this item a divider; all other fields are ignored.
+	Separator bool
+
+	// Disabled greys the item out and blocks OnClick.
+	Disabled bool
+}
+
+// Options configures Set.
+type Options struct {
+	// Window is the platform window handle the menu attaches to. macOS ignores it
+	// (the menu bar is application-global); Windows needs the HWND. Pass what your
+	// framework hands you (e.g. glaze's WebView.Window()).
+	Window unsafe.Pointer
+
+	// Dispatch runs f on the UI thread. OnClick callbacks are invoked through it,
+	// so they can safely touch UI state. If nil, callbacks run on the thread that
+	// delivers the event (the main thread on macOS, so nil is fine there) and Set
+	// itself must be called on the UI thread.
+	//
+	// LEAVE IT NIL when building the menu before the run loop starts — which is
+	// the usual place, right before WebView.Run. Set marshals its AppKit work
+	// through the dispatcher and BLOCKS until that work has run; a dispatcher
+	// that queues onto the main queue (WebView.Dispatch does) has nothing
+	// draining it until the run loop is going, so the call never returns. The
+	// symptom is a process hanging with no window and no error, which is worth
+	// naming here because passing the WebView's own Dispatch is the
+	// obvious-looking thing to do. Pass a dispatcher only when calling Set from
+	// another goroutine while the UI is already running.
+	Dispatch func(func())
+}
+
+// Set installs items as the application's main menu, replacing any previous one,
+// and returns a handle. Build menus must run on the UI thread; pass
+// Options.Dispatch if you call Set from another goroutine.
+func Set(items []Item, opts Options) (*Menu, error) { return set(items, opts) }
+
+// Menu is an installed menu. Release tears it down (restores the previous menu /
+// window procedure where applicable); it is optional and idempotent.
+type Menu struct {
+	release func()
+}
+
+// Release removes the menu and frees what Set retained. Safe to call once; later
+// calls are no-ops.
+func (m *Menu) Release() {
+	if m == nil || m.release == nil {
+		return
+	}
+	r := m.release
+	m.release = nil
+	r()
+}

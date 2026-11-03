@@ -1,9 +1,15 @@
-//go:build linux
-
 package glaze
 
 import (
+	"fmt"
+	"github.com/ebitengine/purego"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+
 	"errors"
+	"flag"
 	"os"
 	"runtime"
 	"sync/atomic"
@@ -21,6 +27,8 @@ var (
 	resErrorUnbind atomic.Value // string
 	resRichTypes   atomic.Value // string
 	resEmbed       atomic.Value // string
+	resDialogCfg   atomic.Value // string
+	resPrgname     atomic.Value // string
 )
 
 // hasDisplay reports whether a windowing system is available.
@@ -38,12 +46,38 @@ func guiAvailable() bool {
 }
 
 func TestMain(m *testing.M) {
+	flag.Parse()
 	runtime.LockOSThread()
-	if guiAvailable() {
+	if !testing.Short() && guiAvailable() {
 		resBridge.Store(bridgeScenario())
 		resErrorUnbind.Store(errorUnbindScenario())
 		resRichTypes.Store(richTypesScenario())
 		resEmbed.Store(embedScenario())
+		resDialogCfg.Store(dialogConfigScenario())
+		resNoBridge.Store(noBridgeScenario())
+		resHideUntilLoaded.Store(hideUntilLoadedScenario())
+		resRevealTiming.Store(revealTimingScenario())
+		resSpinner.Store(spinnerScenario())
+		resLocalPage.Store(localPageScenario())
+		resMediaCapture.Store(mediaCaptureScenario())
+		resNavigation.Store(navigationScenario())
+		resURLChange.Store(urlChangeScenario())
+		resURLCommit.Store(urlCommitScenario())
+		resScriptDialog.Store(scriptDialogScenario())
+		resGestures.Store(gesturesScenario())
+		resMediaOrigin.Store(mediaOriginScenario())
+		resSchemeReuse.Store(schemeReuseScenario())
+		resHistory.Store(historyScenario())
+		resNewWindow.Store(newWindowScenario())
+		resFind.Store(findScenario())
+		resZoom.Store(zoomScenario())
+		resDownload.Store(downloadScenario())
+		resEphemeral.Store(ephemeralScenario())
+		resNoDownloadHandler.Store(noDownloadHandlerScenario())
+		resCookies.Store(cookiesScenario())
+		resClipboard.Store(clipboardScenario())
+		resOnClose.Store(onCloseScenario())
+		resPrgname.Store("name=" + cstr(gGetPrgname())) // never "": unset must fail, not skip
 	}
 	os.Exit(m.Run())
 }
@@ -51,7 +85,8 @@ func TestMain(m *testing.M) {
 // embedScenario embeds a web view into a caller-provided GtkWindow and verifies
 // the engine does not take ownership and Destroy leaves the host window intact.
 func embedScenario() string {
-	if err := ensureInit(); err != nil {
+	err := ensureInit()
+	if err != nil {
 		return "init error: " + err.Error()
 	}
 	if !gtkInit() {
@@ -104,7 +139,7 @@ func bridgeScenario() string {
 		}
 		w.Terminate()
 	})
-	time.AfterFunc(15*time.Second, w.Terminate)
+	defer time.AfterFunc(15*time.Second, w.Terminate).Stop()
 
 	w.SetHtml(`<!DOCTYPE html><html><body><script>
 window.addEventListener('load', async function(){
@@ -143,7 +178,7 @@ func errorUnbindScenario() string {
 	_ = w.Bind("boom", func() (string, error) { return "", errors.New("kaboom") })
 	_ = w.Bind("temp", func() string { return "x" })
 	_ = w.Unbind("temp")
-	time.AfterFunc(15*time.Second, w.Terminate)
+	defer time.AfterFunc(15*time.Second, w.Terminate).Stop()
 
 	w.SetHtml(`<!DOCTYPE html><html><body><script>
 window.addEventListener('load', async function(){
@@ -188,7 +223,7 @@ func richTypesScenario() string {
 		}
 		return t
 	})
-	time.AfterFunc(15*time.Second, w.Terminate)
+	defer time.AfterFunc(15*time.Second, w.Terminate).Stop()
 
 	w.SetHtml(`<!DOCTYPE html><html><body><script>
 window.addEventListener('load', async function(){
@@ -206,6 +241,36 @@ window.addEventListener('load', async function(){
 		return r
 	default:
 		return "no report"
+	}
+}
+
+// dialogConfigScenario verifies the GtkFileChooserNative plumbing: a chooser is
+// created, configured for multiple selection and given a type filter, then
+// destroyed -- all without gtk_native_dialog_run (which is modal and needs user
+// input). The full dialog is exercised manually via examples/filedialog.
+func dialogConfigScenario() string {
+	err := ensureDialogInit()
+	if err != nil {
+		return "dialog init error: " + err.Error()
+	}
+	if !gtkInit() {
+		return "gtk_init failed"
+	}
+	dlg := gtkFileChooserNativeNew("Pick", 0, gtkFileChooserActionOpen, "_Open", "_Cancel")
+	if dlg == 0 {
+		return "chooser nil"
+	}
+	defer gObjectUnref(dlg)
+	gtkFileChooserSetSelectMultiple(dlg, true)
+	applyChooserFilters(dlg, []FileFilter{{Name: "Images", Extensions: []string{"png", "jpg"}}})
+	return "dialog-config-ok"
+}
+
+func TestDialogConfig(t *testing.T) {
+	got, _ := resDialogCfg.Load().(string)
+	requireGUI(t, got)
+	if got != "dialog-config-ok" {
+		t.Fatalf("dialog config = %q, want %q", got, "dialog-config-ok")
 	}
 }
 
@@ -241,4 +306,152 @@ func TestRichBindingTypes(t *testing.T) {
 	if got != want {
 		t.Fatalf("rich types = %q, want %q", got, want)
 	}
+}
+
+var resClipboard atomic.Value // string
+
+// clipboardScenario reads WebKitGTK's script clipboard setting for a web view
+// with and without NoBridge: a page the app does not control gets no script
+// access to the clipboard, the app's own pages keep it.
+func clipboardScenario() string {
+	names := []string{"libwebkit2gtk-4.1.so.0", "libwebkit2gtk-4.0.so.37"}
+	if gtk4 {
+		names = []string{"libwebkitgtk-6.0.so.4"}
+	}
+	var got []string
+	for _, noBridge := range []bool{false, true} {
+		v, err := NewWithOptions(Options{NoBridge: noBridge})
+		if err != nil {
+			return "new error: " + err.Error()
+		}
+		webkit, err := openFirst(names...)
+		if err != nil {
+			return "webkit: " + err.Error()
+		}
+		var allowed func(settings uintptr) bool
+		purego.RegisterLibFunc(&allowed, webkit, "webkit_settings_get_javascript_can_access_clipboard")
+		got = append(got, fmt.Sprintf("nobridge=%v clipboard=%v", noBridge, allowed(webkitWebViewGetSettings(v.(*webview).webview))))
+		v.Destroy()
+	}
+	return strings.Join(got, ", ")
+}
+
+func TestNoBridgeDeniesClipboard(t *testing.T) {
+	got, _ := resClipboard.Load().(string)
+	requireGUI(t, got)
+	want := "nobridge=false clipboard=true, nobridge=true clipboard=false"
+	if got != want {
+		t.Fatalf("script clipboard access: got %q, want %q", got, want)
+	}
+}
+
+var resNoDownloadHandler atomic.Value // string
+
+// noDownloadHandlerScenario: without OnDownload, WebKitGTK would save an
+// attachment to the Downloads folder (or home) on its own; glaze cancels it.
+func noDownloadHandlerScenario() string {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Disposition", `attachment; filename="glaze-unasked.txt"`)
+		_, _ = fmt.Fprint(rw, "must not be saved")
+	}))
+	defer srv.Close()
+	v, err := NewWithOptions(Options{})
+	if err != nil {
+		return "new error: " + err.Error()
+	}
+	defer v.Destroy()
+	time.AfterFunc(3*time.Second, v.Terminate)
+	v.Navigate(srv.URL + "/")
+	v.Run()
+	home, _ := os.UserHomeDir()
+	var found []string
+	for _, dir := range []string{filepath.Join(home, "Downloads"), home, os.TempDir()} {
+		p := filepath.Join(dir, "glaze-unasked.txt")
+		_, err := os.Stat(p)
+		if err == nil {
+			found = append(found, p)
+			_ = os.Remove(p)
+		}
+	}
+	return fmt.Sprintf("saved without asking: %v", found)
+}
+
+func TestNoDownloadWithoutHandler(t *testing.T) {
+	got, _ := resNoDownloadHandler.Load().(string)
+	requireGUI(t, got)
+	if got != "saved without asking: []" {
+		t.Fatal(got)
+	}
+}
+
+var resCookies atomic.Value // string
+
+// cookiesScenario loads a page that sets a cookie and checks that the cookie
+// store is a file beside the rest of the website data, not memory only.
+func cookiesScenario() string {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		http.SetCookie(rw, &http.Cookie{Name: "glaze", Value: "kept", MaxAge: 3600})
+		_, _ = fmt.Fprint(rw, "<html><body>cookie</body></html>")
+	}))
+	defer srv.Close()
+	v, err := NewWithOptions(Options{OnNavigation: func(NavigationEvent) {}})
+	if err != nil {
+		return "new error: " + err.Error()
+	}
+	w := v.(*webview)
+	manager := webkitSessionGetDataManager(webkitWebViewGetSession(w.webview))
+	base := cstr(webkitDataManagerGetBaseDataDir(manager))
+	if base == "" && webkitDataManagerGetLocalStorage != nil {
+		base = filepath.Dir(cstr(webkitDataManagerGetLocalStorage(manager)))
+	}
+	time.AfterFunc(3*time.Second, v.Terminate)
+	v.Navigate(srv.URL + "/")
+	v.Run()
+	v.Destroy()
+	_, err = os.Stat(filepath.Join(base, "cookies.sqlite"))
+	return fmt.Sprintf("cookies.sqlite in the data dir: %v", err == nil)
+}
+
+func TestCookiesPersist(t *testing.T) {
+	got, _ := resCookies.Load().(string)
+	requireGUI(t, got)
+	if got != "cookies.sqlite in the data dir: true" {
+		t.Fatal(got)
+	}
+}
+
+// GTK4 names the window after the program name, which gtk_init without argv
+// leaves unset; glaze sets it from argv[0].
+func TestProgramNameNamesTheWindow(t *testing.T) {
+	got, _ := resPrgname.Load().(string)
+	requireGUI(t, got)
+	want := "name=" + filepath.Base(os.Args[0])
+	if got != want {
+		t.Fatalf("g_get_prgname = %q, want %q", got, want)
+	}
+}
+
+var gtkWidgetGetVisible func(widget uintptr) bool
+
+func spinnerVisible(w *webview) bool {
+	if gtkWidgetGetVisible == nil {
+		purego.RegisterLibFunc(&gtkWidgetGetVisible, gtkLib, "gtk_widget_get_visible")
+	}
+	return w.spinner != 0 && gtkWidgetGetVisible(w.spinner)
+}
+
+// enableMockCapture gives the view simulated cameras and microphones, so the
+// permission path runs where there is no device (CI).
+func enableMockCapture(w *webview) {
+	var setMock func(settings uintptr, enabled bool)
+	purego.RegisterLibFunc(&setMock, webkitLib, "webkit_settings_set_enable_mock_capture_devices")
+	setMock(webkitWebViewGetSettings(w.webview), true)
+}
+
+func windowVisible(*webview) bool { return true }
+
+func navGesturesOn(w *webview) bool {
+	var get func(settings uintptr) bool
+	purego.RegisterLibFunc(&get, webkitLib, "webkit_settings_get_enable_back_forward_navigation_gestures")
+	return get(webkitWebViewGetSettings(w.webview))
 }

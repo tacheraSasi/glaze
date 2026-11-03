@@ -74,11 +74,12 @@ func guidEqual(a, b *guid) bool {
 }
 
 var (
-	iidIUnknown            = guid{0x00000000, 0x0000, 0x0000, [8]byte{0xC0, 0, 0, 0, 0, 0, 0, 0x46}}
-	iidEnvironmentComplete = guid{0x4E8A3389, 0xC9D8, 0x4BD2, [8]byte{0xB6, 0xB5, 0x12, 0x4F, 0xEE, 0x6C, 0xC1, 0x4D}}
-	iidControllerComplete  = guid{0x6C4819F3, 0xC9B7, 0x4260, [8]byte{0x81, 0x27, 0xC9, 0xF5, 0xBD, 0xE7, 0xF6, 0x8C}}
-	iidMessageReceived     = guid{0x57213F19, 0x00E6, 0x49FA, [8]byte{0x8E, 0x07, 0x89, 0x8E, 0xA0, 0x1E, 0xCB, 0xD2}}
-	iidScriptAdded         = guid{0xB99369F3, 0x9B11, 0x47B5, [8]byte{0xBC, 0x6F, 0x8E, 0x78, 0x95, 0xFC, 0xEA, 0x17}}
+	iidIUnknown             = guid{0x00000000, 0x0000, 0x0000, [8]byte{0xC0, 0, 0, 0, 0, 0, 0, 0x46}}
+	iidEnvironmentComplete  = guid{0x4E8A3389, 0xC9D8, 0x4BD2, [8]byte{0xB6, 0xB5, 0x12, 0x4F, 0xEE, 0x6C, 0xC1, 0x4D}}
+	iidControllerComplete   = guid{0x6C4819F3, 0xC9B7, 0x4260, [8]byte{0x81, 0x27, 0xC9, 0xF5, 0xBD, 0xE7, 0xF6, 0x8C}}
+	iidMessageReceived      = guid{0x57213F19, 0x00E6, 0x49FA, [8]byte{0x8E, 0x07, 0x89, 0x8E, 0xA0, 0x1E, 0xCB, 0xD2}}
+	iidScriptAdded          = guid{0xB99369F3, 0x9B11, 0x47B5, [8]byte{0xBC, 0x6F, 0x8E, 0x78, 0x95, 0xFC, 0xEA, 0x17}}
+	iidWebResourceRequested = guid{0xAB00B74C, 0x15F1, 0x4646, [8]byte{0x80, 0xE8, 0xE7, 0x63, 0x41, 0xD2, 0x5D, 0x71}}
 )
 
 // --- COM vtable layouts (exact IDL order; uintptr per slot) ----------------
@@ -160,7 +161,32 @@ type iCoreWebView2Vtbl struct {
 	PostWebMessageAsString              uintptr
 	AddWebMessageReceived               uintptr
 	RemoveWebMessageReceived            uintptr
-	// (remaining methods omitted; none are called)
+	// The interface continues; we declare through AddWebResourceRequestedFilter
+	// (needed for custom-scheme serving) so its vtbl offset is correct. Later
+	// methods are omitted; none are called.
+	CallDevToolsProtocolMethod             uintptr
+	GetBrowserProcessID                    uintptr
+	GetCanGoBack                           uintptr
+	GetCanGoForward                        uintptr
+	GoBack                                 uintptr
+	GoForward                              uintptr
+	GetDevToolsProtocolEventReceiver       uintptr
+	Stop                                   uintptr
+	AddNewWindowRequested                  uintptr
+	RemoveNewWindowRequested               uintptr
+	AddDocumentTitleChanged                uintptr
+	RemoveDocumentTitleChanged             uintptr
+	GetDocumentTitle                       uintptr
+	AddHostObjectToScript                  uintptr
+	RemoveHostObjectFromScript             uintptr
+	OpenDevToolsWindow                     uintptr
+	AddContainsFullScreenElementChanged    uintptr
+	RemoveContainsFullScreenElementChanged uintptr
+	GetContainsFullScreenElement           uintptr
+	AddWebResourceRequested                uintptr
+	RemoveWebResourceRequested             uintptr
+	AddWebResourceRequestedFilter          uintptr
+	RemoveWebResourceRequestedFilter       uintptr
 }
 
 type iCoreWebView2SettingsVtbl struct {
@@ -204,12 +230,41 @@ func (i *iEnvironment) CreateController(hwnd, handler uintptr) uintptr {
 	r, _, _ := purego.SyscallN(i.vtbl.CreateCoreWebView2Controller, uintptr(unsafe.Pointer(i)), hwnd, handler)
 	return r
 }
+
+// AddRef/Release are the environment's IUnknown lifetime methods. The
+// environment is used long after its creation callback returns - at request
+// time, by CreateWebResourceResponse for custom schemes - so a reference is
+// held for the life of the webview (taken in handlerInvoke, dropped in Destroy)
+// rather than relying on the callback's transient one.
+func (i *iEnvironment) AddRef()  { purego.SyscallN(i.vtbl.AddRef, uintptr(unsafe.Pointer(i))) }
+func (i *iEnvironment) Release() { purego.SyscallN(i.vtbl.Release, uintptr(unsafe.Pointer(i))) }
 func (i *iController) GetCoreWebView2(out *uintptr) uintptr {
 	r, _, _ := purego.SyscallN(i.vtbl.GetCoreWebView2, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(out)))
 	return r
 }
 func (i *iController) PutIsVisible(v bool) {
 	purego.SyscallN(i.vtbl.PutIsVisible, uintptr(unsafe.Pointer(i)), boolToUintptr(v))
+}
+
+// moveFocusReasonProgrammatic is COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC:
+// focus moved by the host, not by a Tab key. The reason is a plain enum (a
+// scalar), so MoveFocus is not arch-specific the way putBounds is.
+const moveFocusReasonProgrammatic = 0
+
+// MoveFocus pushes keyboard focus into the hosted WebView2 content. Without it,
+// the content stays unfocused until the user clicks the page - a keyboard and
+// screen-reader accessibility gap, since focus on the host HWND does not reach
+// the WebView2 child HWND on its own.
+func (i *iController) MoveFocus(reason uintptr) {
+	purego.SyscallN(i.vtbl.MoveFocus, uintptr(unsafe.Pointer(i)), reason)
+}
+
+// getBounds reads the controller's current bounds. Unlike putBounds (RECT by
+// value, arch-specific), the getter takes a RECT* out-param, so one signature
+// serves both arches. Used by the embed regression test to assert the bounds
+// follow the host window.
+func (i *iController) getBounds(r *rect) {
+	purego.SyscallN(i.vtbl.GetBounds, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(r)))
 }
 
 // AddRef/Close/Release are the controller's IUnknown/lifetime methods.
@@ -225,6 +280,7 @@ func (i *iCoreWebView2) GetSettings(out *uintptr) uintptr {
 func (i *iCoreWebView2) Navigate(url *uint16) {
 	purego.SyscallN(i.vtbl.Navigate, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(url)))
 }
+func (i *iCoreWebView2) call(fn uintptr) { purego.SyscallN(fn, uintptr(unsafe.Pointer(i))) }
 func (i *iCoreWebView2) NavigateToString(html *uint16) {
 	purego.SyscallN(i.vtbl.NavigateToString, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(html)))
 }
@@ -243,6 +299,12 @@ func (i *iCoreWebView2) Release() {
 func (i *iCoreWebView2) AddWebMessageReceived(handler uintptr, token *uint64) {
 	purego.SyscallN(i.vtbl.AddWebMessageReceived, uintptr(unsafe.Pointer(i)), handler, uintptr(unsafe.Pointer(token)))
 }
+func (i *iCoreWebView2) AddWebResourceRequested(handler uintptr, token *uint64) {
+	purego.SyscallN(i.vtbl.AddWebResourceRequested, uintptr(unsafe.Pointer(i)), handler, uintptr(unsafe.Pointer(token)))
+}
+func (i *iCoreWebView2) AddWebResourceRequestedFilter(uri *uint16, ctx uint32) {
+	purego.SyscallN(i.vtbl.AddWebResourceRequestedFilter, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(uri)), uintptr(ctx))
+}
 func (i *iCoreWebView2) AddRef() { purego.SyscallN(i.vtbl.AddRef, uintptr(unsafe.Pointer(i))) }
 
 func (i *iSettings) PutAreDevToolsEnabled(v bool) {
@@ -250,6 +312,9 @@ func (i *iSettings) PutAreDevToolsEnabled(v bool) {
 }
 func (i *iSettings) PutIsStatusBarEnabled(v bool) {
 	purego.SyscallN(i.vtbl.PutIsStatusBarEnabled, uintptr(unsafe.Pointer(i)), boolToUintptr(v))
+}
+func (i *iSettings) PutIsWebMessageEnabled(v bool) {
+	purego.SyscallN(i.vtbl.PutIsWebMessageEnabled, uintptr(unsafe.Pointer(i)), boolToUintptr(v))
 }
 func (i *iMessageArgs) TryGetWebMessageAsString(out *uintptr) uintptr {
 	r, _, _ := purego.SyscallN(i.vtbl.TryGetWebMessageAsStr, uintptr(unsafe.Pointer(i)), uintptr(unsafe.Pointer(out)))
@@ -270,6 +335,7 @@ const (
 	kindController
 	kindMessage
 	kindScript
+	kindWebResourceRequested
 )
 
 type comHandlerVtbl struct {
@@ -351,14 +417,21 @@ func handlerInvoke(this, a, b uintptr) uintptr {
 	case kindEnv:
 		// Invoke(this, HRESULT res, ICoreWebView2Environment* env)
 		if int32(a) >= 0 && b != 0 { // SUCCEEDED(res)
+			// Hold our own reference: the environment is used later, at request
+			// time, by CreateWebResourceResponse (custom schemes). Released in
+			// Destroy. Matches the controller/webview2 references below.
+			asEnvironment(b).AddRef()
+			w.environment = b
 			if int32(asEnvironment(b).CreateController(w.window, handlerPtr(w.ctrlH))) < 0 {
 				w.ready = true // CreateController failed synchronously; unblock embed.
 			}
 		} else {
-			w.ready = true // environment creation failed; unblock embed (controller stays 0).
+			w.initHR = int32(a) // #nosec G115 -- an HRESULT is 32 bits
+			w.ready = true      // environment creation failed; unblock embed (controller stays 0).
 		}
 	case kindController:
 		// Invoke(this, HRESULT res, ICoreWebView2Controller* controller)
+		w.initHR = int32(a) // #nosec G115 -- an HRESULT is 32 bits; read only on failure
 		if int32(a) >= 0 && b != 0 {
 			ctrl := asController(b)
 			var wv uintptr
@@ -369,8 +442,22 @@ func handlerInvoke(this, a, b uintptr) uintptr {
 			if wv != 0 {
 				cw := asWebView2(wv)
 				cw.AddRef()
-				var token uint64
-				cw.AddWebMessageReceived(handlerPtr(w.msgH), &token)
+				if !w.noBridge {
+					var token uint64
+					cw.AddWebMessageReceived(handlerPtr(w.msgH), &token)
+				}
+				// Custom-scheme serving: the schemes were registered with the
+				// environment; intercept their requests and answer from the
+				// SchemeHandler (see serveSchemeWindows). "app:*" rather than
+				// "app*", which would also catch "apple://".
+				if len(w.schemeHandlers) > 0 {
+					w.wrrH = newHandler(w.id, kindWebResourceRequested, &iidWebResourceRequested)
+					var wrrTok uint64
+					cw.AddWebResourceRequested(handlerPtr(w.wrrH), &wrrTok)
+					for scheme := range w.schemeHandlers {
+						cw.AddWebResourceRequestedFilter(utf16(scheme+":*"), 0) // 0 = ALL
+					}
+				}
 			}
 		}
 		w.ready = true
@@ -390,6 +477,11 @@ func handlerInvoke(this, a, b uintptr) uintptr {
 			w.lastScript = wideToString(b)
 		}
 		w.scriptDone = true
+	case kindWebResourceRequested:
+		// Invoke(this, ICoreWebView2* sender, ICoreWebView2WebResourceRequestedEventArgs* args)
+		if b != 0 {
+			w.serveSchemeWindows(b)
+		}
 	}
 	return 0 // S_OK
 }
@@ -399,6 +491,7 @@ func handlerInvoke(this, a, b uintptr) uintptr {
 var (
 	coInitializeEx func(reserved uintptr, coinit uint32) int32
 	coTaskMemFree  func(p uintptr)
+	coTaskMemAlloc func(n uintptr) uintptr
 
 	regOpenKeyExW    func(key uintptr, subkey *uint16, opts, desired uint32, out *uintptr) int32
 	regQueryValueExW func(key uintptr, name *uint16, reserved uintptr, typ *uint32, data *byte, dataLen *uint32) int32
@@ -414,7 +507,8 @@ type rect struct{ Left, Top, Right, Bottom int32 }
 
 func ensureCOMInit() error {
 	comInitOnce.Do(func() {
-		if err := ensureWinInit(); err != nil {
+		err := ensureWinInit()
+		if err != nil {
 			comInitErr = err
 			return
 		}
@@ -446,6 +540,7 @@ func ensureCOMInit() error {
 		}
 		reg(&coInitializeEx, ole32, "CoInitializeEx")
 		reg(&coTaskMemFree, ole32, "CoTaskMemFree")
+		reg(&coTaskMemAlloc, ole32, "CoTaskMemAlloc")
 		reg(&regOpenKeyExW, advapi32, "RegOpenKeyExW")
 		reg(&regQueryValueExW, advapi32, "RegQueryValueExW")
 		reg(&regCloseKey, advapi32, "RegCloseKey")
@@ -478,7 +573,14 @@ const (
 // findEmbeddedBrowserDLL locates the installed Edge WebView2 Runtime's
 // EmbeddedBrowserWebView.dll via the registry (HKLM then HKCU), reimplementing
 // loader.hh's built-in discovery so no DLL is bundled.
+//
+// The registry can name a version folder that no longer exists: a self-update
+// installs the new version beside the old one and deletes the old, and if it is
+// interrupted the registration is left pointing at the deleted folder while a
+// working runtime sits next to it. So when the registered folder is missing,
+// look beside it before giving up.
 func findEmbeddedBrowserDLL() (string, error) {
+	stale := ""
 	for _, root := range []uintptr{hkeyLocalMachine, hkeyCurrentUser} {
 		val, err := regReadString(root, edgeClientStateKey, "EBWebView")
 		if err != nil || val == "" {
@@ -490,11 +592,57 @@ func findEmbeddedBrowserDLL() (string, error) {
 			continue
 		}
 		dll := filepath.Join(val, "EBWebView", arch(), "EmbeddedBrowserWebView.dll")
-		if _, err := os.Stat(dll); err == nil {
+		_, err = os.Stat(dll)
+		if err == nil {
 			return dll, nil
 		}
+		sibling, ok := newestRuntimeDLL(filepath.Dir(val))
+		if ok {
+			return sibling, nil
+		}
+		stale = val
+	}
+	if stale != "" {
+		return "", fmt.Errorf("webview2: registered runtime folder %s is missing and no runtime was found beside it (reinstall the Edge WebView2 Runtime)", stale)
 	}
 	return "", errors.New("webview2: Edge WebView2 Runtime not found (install it)")
+}
+
+// newestRuntimeDLL returns EmbeddedBrowserWebView.dll from the highest version
+// folder under dir that has one for this architecture.
+func newestRuntimeDLL(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	best, bestDLL := "", ""
+	for _, e := range entries {
+		v := e.Name()
+		if !e.IsDir() || !versionBuildAtLeast(v, minAPIVersion) {
+			continue
+		}
+		dll := filepath.Join(dir, v, "EBWebView", arch(), "EmbeddedBrowserWebView.dll")
+		_, err = os.Stat(dll)
+		if err != nil {
+			continue
+		}
+		if best == "" || versionLess(best, v) {
+			best, bestDLL = v, dll
+		}
+	}
+	return bestDLL, bestDLL != ""
+}
+
+// versionLess compares dotted numeric versions field by field.
+func versionLess(a, b string) bool {
+	pa, pb := splitDots(a), splitDots(b)
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		x, y := atoiSafe(pa[i]), atoiSafe(pb[i])
+		if x != y {
+			return x < y
+		}
+	}
+	return len(pa) < len(pb)
 }
 
 func arch() string {
@@ -543,7 +691,8 @@ func regReadString(root uintptr, subkey, name string) (string, error) {
 }
 
 // createEnvironment loads the discovered runtime DLL and calls its
-// CreateWebViewEnvironmentWithOptionsInternal export.
+// CreateWebViewEnvironmentWithOptionsInternal export, registering schemes as
+// custom schemes when there are any (see newEnvOptions).
 //
 // Trade-off (deliberate): this is the internal/undocumented export that
 // WebView2Loader.dll itself wraps, and calling it directly is what lets glaze
@@ -553,13 +702,24 @@ func regReadString(root uintptr, subkey, name string) (string, error) {
 // WebView2Loader.dll, which would have to be shipped alongside the binary. glaze
 // favors the zero-DLL design; if a future Edge runtime drops this export, the
 // GetProcAddress below fails with a clear error rather than misbehaving.
-func createEnvironment(userDataDir string, envHandler *comHandler) error {
+func createEnvironment(userDataDir string, schemes []string, envHandler *comHandler) error {
 	dll, err := findEmbeddedBrowserDLL()
 	if err != nil {
 		dbg("findEmbeddedBrowserDLL: %v", err)
 		return err
 	}
 	dbg("runtime dll: %s", dll)
+	var options uintptr
+	if len(schemes) > 0 {
+		version := runtimeVersion(dll)
+		if !versionBuildAtLeast(version, minSchemeAPIVersion) {
+			return fmt.Errorf("webview2: custom URL schemes need Edge WebView2 Runtime %s or later, found %s (update it)", targetBrowserVersion, version)
+		}
+		options, err = newEnvOptions(schemes)
+		if err != nil {
+			return err
+		}
+	}
 	mod, err := syscall.LoadLibrary(dll)
 	if err != nil {
 		return fmt.Errorf("load %s: %w", dll, err)
@@ -576,7 +736,7 @@ func createEnvironment(userDataDir string, envHandler *comHandler) error {
 		1, // bool: true
 		0, // runtime_type: installed
 		uintptr(unsafe.Pointer(utf16(userDataDir))),
-		0, // options: null
+		options, // ICoreWebView2EnvironmentOptions*, or null for the defaults
 		handlerPtr(envHandler),
 	)
 	dbg("CreateWebViewEnvironmentWithOptionsInternal -> HRESULT 0x%08X", uint32(r))
@@ -586,13 +746,10 @@ func createEnvironment(userDataDir string, envHandler *comHandler) error {
 	return nil
 }
 
-func userDataFolder() string {
-	base := os.Getenv("APPDATA")
-	if base == "" {
-		base = os.TempDir()
-	}
-	exe, _ := os.Executable()
-	return filepath.Join(base, filepath.Base(exe))
+// runtimeVersion is the version folder a runtime DLL sits in:
+// <root>\<version>\EBWebView\<arch>\EmbeddedBrowserWebView.dll.
+func runtimeVersion(dll string) string {
+	return filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(dll))))
 }
 
 // --- embed + the WebView2-backed WebView methods ---------------------------
@@ -600,7 +757,8 @@ func userDataFolder() string {
 const coinitApartmentThreaded = 0x2
 
 func (w *webview) embed(debug bool) error {
-	if err := ensureCOMInit(); err != nil {
+	err := ensureCOMInit()
+	if err != nil {
 		return err
 	}
 	coInitializeEx(0, coinitApartmentThreaded) // tolerate S_OK/S_FALSE/RPC_E_CHANGED_MODE
@@ -610,8 +768,11 @@ func (w *webview) embed(debug bool) error {
 	w.msgH = newHandler(w.id, kindMessage, &iidMessageReceived)
 	w.scriptH = newHandler(w.id, kindScript, &iidScriptAdded)
 
-	dbg("embed: requesting environment (userDataFolder=%s)", userDataFolder())
-	if err := createEnvironment(userDataFolder(), w.envH); err != nil {
+	schemes := sortedSchemes(w.schemeHandlers)
+	dataDir := userDataFolder(schemes)
+	dbg("embed: requesting environment (userDataFolder=%s, schemes=%v)", dataDir, schemes)
+	err = createEnvironment(dataDir, schemes, w.envH)
+	if err != nil {
 		return err
 	}
 
@@ -631,7 +792,7 @@ func (w *webview) embed(debug bool) error {
 	}
 	dbg("embed: ready=%v controller=0x%x webview2=0x%x", w.ready, w.controller, w.webview2)
 	if w.controller == 0 || w.webview2 == 0 {
-		return errors.New("webview2: environment/controller creation failed")
+		return fmt.Errorf("webview2: environment/controller creation failed (HRESULT 0x%08X)", uint32(w.initHR)) // #nosec G115 -- printing the HRESULT's bits
 	}
 
 	var settings uintptr
@@ -639,14 +800,21 @@ func (w *webview) embed(debug bool) error {
 		s := asSettings(settings)
 		s.PutAreDevToolsEnabled(debug)
 		s.PutIsStatusBarEnabled(false)
+		s.PutIsWebMessageEnabled(!w.noBridge)
 	}
 
-	w.addUserScript(createInitScript(bridgePostFn))
+	if !w.noBridge {
+		w.addUserScript(createInitScript(bridgePostFn))
+	}
 
 	w.resizeWebView()
 	asController(w.controller).PutIsVisible(true)
 	showWindow(w.window, swShow)
 	updateWindow(w.window)
+	// Pull keyboard focus into the content now that the controller exists. The
+	// window already took WM_SETFOCUS during creation - before the controller was
+	// ready, so that path could not move focus inward - so do it once here.
+	asController(w.controller).MoveFocus(moveFocusReasonProgrammatic)
 	return nil
 }
 
@@ -659,6 +827,52 @@ func (w *webview) resizeWebView() {
 		asController(w.controller).putBounds(r)
 	}
 }
+
+func (w *webview) Focus() {
+	if w.controller == 0 {
+		return
+	}
+	asController(w.controller).MoveFocus(moveFocusReasonProgrammatic)
+}
+
+func (w *webview) Raise() {
+	if w.window == 0 {
+		return
+	}
+	// Restore first: a minimised window cannot come to the foreground, and
+	// SetForegroundWindow would report failure rather than un-minimise it.
+	showWindow(w.window, swRestore)
+	// Windows refuses the foreground to a process that has not interacted with
+	// the user recently, and flashes the taskbar button instead. That is the
+	// OS's anti-focus-stealing policy working as intended, so the result is not
+	// treated as an error.
+	setForegroundWin(w.window)
+}
+
+// history runs one of ICoreWebView2's no-argument navigation methods.
+func (w *webview) history(pick func(*iCoreWebView2) uintptr) {
+	if w.webview2 == 0 {
+		return
+	}
+	cw := asWebView2(w.webview2)
+	cw.call(pick(cw))
+}
+
+// SetZoom: the controller's ZoomFactor takes a double, which SyscallN cannot
+// pass in the floating-point register the Windows x64 ABI wants.
+func (w *webview) SetZoom(float64) {}
+
+// Find: WebView2's find API needs a newer runtime interface than glaze binds.
+func (w *webview) Find(_ string, _ bool, done func(bool)) {
+	if done != nil {
+		done(false)
+	}
+}
+
+func (w *webview) GoBack()    { w.history(func(c *iCoreWebView2) uintptr { return c.vtbl.GoBack }) }
+func (w *webview) GoForward() { w.history(func(c *iCoreWebView2) uintptr { return c.vtbl.GoForward }) }
+func (w *webview) Reload()    { w.history(func(c *iCoreWebView2) uintptr { return c.vtbl.Reload }) }
+func (w *webview) Stop()      { w.history(func(c *iCoreWebView2) uintptr { return c.vtbl.Stop }) }
 
 func (w *webview) Navigate(url string) {
 	if w.webview2 == 0 {
@@ -762,12 +976,16 @@ func (w *webview) bindingNamesLocked() []string {
 }
 
 func (w *webview) Bind(name string, f any) error {
+	if w.noBridge {
+		return ErrBridgeDisabled
+	}
 	wrapper, err := makeFuncWrapper(f)
 	if err != nil {
 		return err
 	}
 	w.mu.Lock()
-	if _, exists := w.bindings[name]; exists {
+	_, exists := w.bindings[name]
+	if exists {
 		w.mu.Unlock()
 		return errors.New("function name already bound")
 	}
@@ -782,8 +1000,12 @@ func (w *webview) Bind(name string, f any) error {
 }
 
 func (w *webview) Unbind(name string) error {
+	if w.noBridge {
+		return ErrBridgeDisabled
+	}
 	w.mu.Lock()
-	if _, exists := w.bindings[name]; !exists {
+	_, exists := w.bindings[name]
+	if !exists {
 		w.mu.Unlock()
 		return errors.New("function name not bound")
 	}
@@ -800,7 +1022,8 @@ func (w *webview) onMessage(body string) {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
 	}
-	if err := json.Unmarshal([]byte(body), &m); err != nil {
+	err := json.Unmarshal([]byte(body), &m)
+	if err != nil {
 		return
 	}
 	w.mu.Lock()

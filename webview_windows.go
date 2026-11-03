@@ -7,12 +7,14 @@
 // webview.dll on Windows.
 //
 // Safety choice (per the COM/Win32 risk review): no Go pointer is ever handed
-// across the C boundary. The engine is identified by an integer id passed via
-// CreateWindow's lpCreateParams, stashed in GWLP_USERDATA, and looked up in a
-// Go map; dispatched closures are keyed by an integer id passed via WM_APP's
-// LPARAM. Only integers cross into C. purego has no Dlopen on Windows, so procs
-// are resolved with syscall.LoadLibrary/GetProcAddress and bound via
-// purego.RegisterFunc; the WndProc uses purego.NewCallback.
+// across the C boundary. The engine is identified by an integer id and looked
+// up in a Go map — for owned windows the id rides CreateWindow's
+// lpCreateParams and is stashed in GWLP_USERDATA; for embedded (host-owned)
+// windows it rides the comctl32 subclass's dwRefData, leaving the host's
+// GWLP_USERDATA alone. Dispatched closures are keyed by an integer id passed
+// via WM_APP's LPARAM. Only integers cross into C. purego has no Dlopen on
+// Windows, so procs are resolved with syscall.LoadLibrary/GetProcAddress and
+// bound via purego.RegisterFunc; the WndProc uses purego.NewCallback.
 
 //go:build windows
 
@@ -36,13 +38,15 @@ const (
 	wsThickFrame       = 0x00040000
 	wsMaximizeBox      = 0x00010000
 
-	swShow = 5
+	swShow    = 5
+	swRestore = 9
 
 	gwlpUserData = -21
 	gwlStyle     = -16
 
 	wmDestroy       = 0x0002
 	wmSize          = 0x0005
+	wmSetFocus      = 0x0007
 	wmClose         = 0x0010
 	wmGetMinMaxInfo = 0x0024
 	wmApp           = 0x8000
@@ -57,22 +61,33 @@ const (
 // --- bound Win32 functions -------------------------------------------------
 
 var (
-	getModuleHandleW  func(name uintptr) uintptr
-	registerClassExW  func(wc *wndClassExW) uint16
-	createWindowExW   func(exStyle uint32, class, name *uint16, style uint32, x, y, w, h int32, parent, menu, inst, param uintptr) uintptr
-	defWindowProcW    func(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr
-	getMessageW       func(m *msgStruct, hwnd uintptr, min, max uint32) int32
-	translateMessage  func(m *msgStruct) int32
-	dispatchMessageW  func(m *msgStruct) uintptr
-	postQuitMessage   func(code int32)
-	postMessageW      func(hwnd uintptr, msg uint32, wp, lp uintptr) int32
-	showWindow        func(hwnd uintptr, cmd int32) int32
-	updateWindow      func(hwnd uintptr) int32
-	destroyWindow     func(hwnd uintptr) int32
-	setWindowLongPtrW func(hwnd uintptr, index int32, val uintptr) uintptr
-	getWindowLongPtrW func(hwnd uintptr, index int32) uintptr
-	setWindowTextW    func(hwnd uintptr, text *uint16) int32
-	setWindowPos      func(hwnd, after uintptr, x, y, w, h int32, flags uint32) int32
+	getModuleHandleW   func(name uintptr) uintptr
+	getCurrentThreadID func() uint32
+	registerClassExW   func(wc *wndClassExW) uint16
+	extractIconExW     func(file *uint16, index int32, big, small *uintptr, n uint32) uint32
+	createWindowExW    func(exStyle uint32, class, name *uint16, style uint32, x, y, w, h int32, parent, menu, inst, param uintptr) uintptr
+	defWindowProcW     func(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr
+	getMessageW        func(m *msgStruct, hwnd uintptr, min, max uint32) int32
+	translateMessage   func(m *msgStruct) int32
+	dispatchMessageW   func(m *msgStruct) uintptr
+	postQuitMessage    func(code int32)
+	postMessageW       func(hwnd uintptr, msg uint32, wp, lp uintptr) int32
+	showWindow         func(hwnd uintptr, cmd int32) int32
+	setForegroundWin   func(hwnd uintptr) int32
+	updateWindow       func(hwnd uintptr) int32
+	destroyWindow      func(hwnd uintptr) int32
+	setWindowLongPtrW  func(hwnd uintptr, index int32, val uintptr) uintptr
+	getWindowLongPtrW  func(hwnd uintptr, index int32) uintptr
+	setWindowTextW     func(hwnd uintptr, text *uint16) int32
+	setWindowPos       func(hwnd, after uintptr, x, y, w, h int32, flags uint32) int32
+
+	// comctl32 subclassing, used in embed mode: the host window keeps its own
+	// window procedure, so glaze's messages (WM_SIZE for bounds, WM_APP for
+	// Dispatch) must be picked up by a subclass that chains everything else
+	// back via DefSubclassProc.
+	setWindowSubclass    func(hwnd, proc, id, refData uintptr) int32
+	removeWindowSubclass func(hwnd, proc, id uintptr) int32
+	defSubclassProc      func(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr
 )
 
 // wndClassExW mirrors WNDCLASSEXW. The blank fields are left zero and unread by
@@ -84,12 +99,12 @@ type wndClassExW struct {
 	_             int32 // cbClsExtra
 	_             int32 // cbWndExtra
 	hInstance     uintptr
-	_             uintptr // hIcon
+	hIcon         uintptr
 	_             uintptr // hCursor
 	_             uintptr // hbrBackground
 	_             *uint16 // lpszMenuName
 	lpszClassName *uint16
-	_             uintptr // hIconSm
+	hIconSm       uintptr
 }
 
 type point struct{ X, Y int32 }
@@ -122,7 +137,8 @@ var (
 	winInitOnce sync.Once
 	winInitErr  error
 
-	wndProcCB uintptr // shared WndProc trampoline
+	wndProcCB      uintptr // shared WndProc trampoline (owned windows)
+	subclassProcCB uintptr // shared SUBCLASSPROC trampoline (embedded windows)
 )
 
 func ensureWinInit() error {
@@ -137,6 +153,16 @@ func ensureWinInit() error {
 			winInitErr = fmt.Errorf("webview: load kernel32.dll: %w", err)
 			return
 		}
+		comctl32, err := syscall.LoadLibrary("comctl32.dll")
+		if err != nil {
+			winInitErr = fmt.Errorf("webview: load comctl32.dll: %w", err)
+			return
+		}
+		shell32, err := syscall.LoadLibrary("shell32.dll")
+		if err != nil {
+			winInitErr = fmt.Errorf("webview: load shell32.dll: %w", err)
+			return
+		}
 		reg := func(fn any, dll syscall.Handle, name string) {
 			if winInitErr != nil {
 				return
@@ -149,7 +175,9 @@ func ensureWinInit() error {
 			purego.RegisterFunc(fn, addr)
 		}
 		reg(&getModuleHandleW, kernel32, "GetModuleHandleW")
+		reg(&getCurrentThreadID, kernel32, "GetCurrentThreadId")
 		reg(&registerClassExW, user32, "RegisterClassExW")
+		reg(&extractIconExW, shell32, "ExtractIconExW")
 		reg(&createWindowExW, user32, "CreateWindowExW")
 		reg(&defWindowProcW, user32, "DefWindowProcW")
 		reg(&getMessageW, user32, "GetMessageW")
@@ -158,16 +186,21 @@ func ensureWinInit() error {
 		reg(&postQuitMessage, user32, "PostQuitMessage")
 		reg(&postMessageW, user32, "PostMessageW")
 		reg(&showWindow, user32, "ShowWindow")
+		reg(&setForegroundWin, user32, "SetForegroundWindow")
 		reg(&updateWindow, user32, "UpdateWindow")
 		reg(&destroyWindow, user32, "DestroyWindow")
 		reg(&setWindowLongPtrW, user32, "SetWindowLongPtrW")
 		reg(&getWindowLongPtrW, user32, "GetWindowLongPtrW")
 		reg(&setWindowTextW, user32, "SetWindowTextW")
 		reg(&setWindowPos, user32, "SetWindowPos")
+		reg(&setWindowSubclass, comctl32, "SetWindowSubclass")
+		reg(&removeWindowSubclass, comctl32, "RemoveWindowSubclass")
+		reg(&defSubclassProc, comctl32, "DefSubclassProc")
 		if winInitErr != nil {
 			return
 		}
 		wndProcCB = purego.NewCallback(wndProc)
+		subclassProcCB = purego.NewCallback(subclassProc)
 	})
 	return winInitErr
 }
@@ -195,6 +228,7 @@ var (
 	engineSeq uintptr
 
 	uiThreadOnce sync.Once
+	uiThreadID   uint32 // the UI thread, for onUIThread
 
 	// windowCount tracks live owned windows so a user-initiated close of the last
 	// one ends Run() (mirrors the macOS backend's ref-count).
@@ -244,16 +278,19 @@ func wndProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 
 	switch msg {
 	case wmApp:
-		w.dispatchMu.Lock()
-		f := w.dispatchMap[lp]
-		delete(w.dispatchMap, lp)
-		w.dispatchMu.Unlock()
-		if f != nil {
-			f()
-		}
+		w.runDispatched(lp)
 		return 0
 	case wmSize:
 		w.resizeWebView()
+		return 0
+	case wmSetFocus:
+		// The host window gained keyboard focus (launch, Alt-Tab back, a title-bar
+		// click); forward it into the WebView2 content so the keyboard and a screen
+		// reader's cursor land in the page, matching the macOS/Linux backends. A
+		// no-op until the controller exists (embed does the initial focus instead).
+		if w.controller != 0 {
+			asController(w.controller).MoveFocus(moveFocusReasonProgrammatic)
+		}
 		return 0
 	case wmGetMinMaxInfo:
 		// Enforce HintMin/HintMax, mirroring win32_edge.hh's WM_GETMINMAXINFO.
@@ -276,6 +313,7 @@ func wndProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		if owned && atomic.LoadInt32(&windowCount) <= 0 {
 			postQuitMessage(0)
 		}
+		callClose(w.onClose)
 		return 0
 	case wmDestroy:
 		// Closed via the OS or by Destroy(): reclaim the engine registry entry so
@@ -293,6 +331,68 @@ func wndProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 	}
 }
 
+// runDispatched runs (and reclaims) the Dispatch closure keyed by id.
+func (w *webview) runDispatched(id uintptr) {
+	w.dispatchMu.Lock()
+	f := w.dispatchMap[id]
+	delete(w.dispatchMap, id)
+	w.dispatchMu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+// subclassProc is the SUBCLASSPROC for embed mode. The host window keeps its
+// own window procedure — writing our id into GWLP_USERDATA (the old approach,
+// issue #29) routed nothing, because wndProc never ran for that window: the
+// WebView2 bounds stayed frozen at their creation size and Dispatch closures
+// were posted into a procedure that ignored them. Subclassing puts this proc
+// in front of the host's: glaze handles its own concerns and chains the rest
+// (close, lifetime, painting — all of it stays the host's business) through
+// DefSubclassProc. The engine travels in dwRefData, so the host's
+// GWLP_USERDATA is no longer touched.
+func subclassProc(hwnd uintptr, msg uint32, wp, lp, _, refData uintptr) uintptr {
+	w := lookupEngine(refData)
+	if w == nil {
+		return defSubclassProc(hwnd, msg, wp, lp)
+	}
+
+	switch msg {
+	case wmApp:
+		// Ours alone: dispatched closures never concern the host.
+		w.runDispatched(lp)
+		return 0
+	case wmSize:
+		w.resizeWebView()
+	case wmSetFocus:
+		// Forward keyboard focus into the WebView2 content, as the owned-window
+		// path does; the host still sees the message afterward.
+		if w.controller != 0 {
+			asController(w.controller).MoveFocus(moveFocusReasonProgrammatic)
+		}
+	case wmGetMinMaxInfo:
+		// Let the host fill its own constraints first, then overlay the ones
+		// set explicitly through SetSize(HintMin/HintMax).
+		r := defSubclassProc(hwnd, msg, wp, lp)
+		mmi := (*minMaxInfo)(ptr(lp))
+		if w.maxWidth > 0 && w.maxHeight > 0 {
+			mmi.ptMaxSize = point{w.maxWidth, w.maxHeight}
+			mmi.ptMaxTrackSize = point{w.maxWidth, w.maxHeight}
+		}
+		if w.minWidth > 0 && w.minHeight > 0 {
+			mmi.ptMinTrackSize = point{w.minWidth, w.minHeight}
+		}
+		return r
+	case wmDestroy:
+		// The host is tearing its window down: detach and unpin the engine so
+		// a never-Destroyed webview is not leaked in the registry.
+		removeWindowSubclass(hwnd, subclassProcCB, w.id)
+		w.window = 0
+		unregisterEngine(w.id)
+	}
+	return defSubclassProc(hwnd, msg, wp, lp)
+}
+
 // --- webview ---------------------------------------------------------------
 
 // webview is the Windows implementation of the WebView interface.
@@ -303,15 +403,25 @@ type webview struct {
 	ownsWindow bool
 
 	// WebView2 / COM state.
-	controller uintptr // ICoreWebView2Controller*
-	webview2   uintptr // ICoreWebView2*
-	envH       *comHandler
-	ctrlH      *comHandler
-	msgH       *comHandler
-	scriptH    *comHandler
-	ready      bool
-	scriptDone bool
-	lastScript string
+	controller  uintptr // ICoreWebView2Controller*
+	webview2    uintptr // ICoreWebView2*
+	environment uintptr // ICoreWebView2Environment* (for CreateWebResourceResponse)
+	envH        *comHandler
+	ctrlH       *comHandler
+	msgH        *comHandler
+	scriptH     *comHandler
+	wrrH        *comHandler // WebResourceRequested handler (custom schemes); nil if none
+	ready       bool
+	initHR      int32 // failing HRESULT of environment/controller creation, for the error
+	scriptDone  bool
+	lastScript  string
+
+	// schemeHandlers serve the app's assets from a custom secure origin instead
+	// of a loopback server; empty unless set via NewWithOptions.
+	schemeHandlers map[string]SchemeHandler
+
+	noBridge bool
+	onClose  func()
 
 	// Window size constraints from SetSize(HintMin/HintMax); enforced in
 	// wndProc's WM_GETMINMAXINFO handler.
@@ -347,16 +457,32 @@ func New(debug bool) (WebView, error) { return NewWindow(debug, nil) }
 // WebView2 COM apartment and the message pump are thread-bound (use Dispatch to
 // re-enter that thread from background goroutines).
 func NewWindow(debug bool, window unsafe.Pointer) (WebView, error) {
-	if err := ensureWinInit(); err != nil {
+	return NewWithOptions(Options{Debug: debug, Window: window})
+}
+
+// NewWithOptions creates a web view configured by opts, including any custom
+// SchemeHandlers (registered with WebView2 as secure custom schemes; see
+// webview2_scheme_windows.go).
+func NewWithOptions(opts Options) (WebView, error) {
+	err := ensureWinInit()
+	if err != nil {
 		return nil, err
 	}
-	uiThreadOnce.Do(runtime.LockOSThread)
+	uiThreadOnce.Do(func() {
+		runtime.LockOSThread()
+		uiThreadID = getCurrentThreadID()
+	})
 
 	w := &webview{
-		ownsWindow:  window == nil,
-		bindings:    map[string]func(id, req string) (any, error){},
-		dispatchMap: map[uintptr]func(){},
+		ownsWindow:     opts.Window == nil,
+		bindings:       map[string]func(id, req string) (any, error){},
+		dispatchMap:    map[uintptr]func(){},
+		schemeHandlers: opts.SchemeHandlers,
+		noBridge:       opts.NoBridge,
+		onClose:        opts.OnClose,
 	}
+	window := opts.Window
+	debug := opts.Debug
 	w.id = registerEngine(w)
 	w.hinst = getModuleHandleW(0)
 
@@ -366,6 +492,7 @@ func NewWindow(debug bool, window unsafe.Pointer) (WebView, error) {
 			hInstance:     w.hinst,
 			lpszClassName: classNamePtr,
 		}
+		wc.hIcon, wc.hIconSm = exeIcons()
 		wc.cbSize = uint32(unsafe.Sizeof(wc))
 		registerClassExW(&wc) // idempotent across instances (same class name)
 
@@ -381,12 +508,20 @@ func NewWindow(debug bool, window unsafe.Pointer) (WebView, error) {
 		atomic.AddInt32(&windowCount, 1)
 	} else {
 		w.window = uintptr(window)
-		// Associate the engine id so wndProc-routed messages resolve (best
-		// effort; the host owns the real window procedure).
-		setWindowLongPtrW(w.window, gwlpUserData, w.id)
+		// Subclass the host window so WM_SIZE keeps the WebView2 bounds in
+		// sync and WM_APP delivers Dispatch closures (see subclassProc). The
+		// host's own window procedure — and its GWLP_USERDATA — stay intact.
+		if setWindowSubclass(w.window, subclassProcCB, w.id, w.id) == 0 {
+			unregisterEngine(w.id)
+			return nil, fmt.Errorf("webview: SetWindowSubclass failed for host window %#x", w.window)
+		}
 	}
 
-	if err := w.embed(debug); err != nil {
+	err = w.embed(debug)
+	if err != nil {
+		// The window exists by now; left behind it would hold the owned-window
+		// count up, and the next person's close would never end Run.
+		w.Destroy()
 		return nil, err
 	}
 	return w, nil
@@ -467,8 +602,18 @@ func (w *webview) Destroy() {
 		asController(w.controller).Release()
 		w.controller = 0
 	}
+	if w.environment != 0 {
+		// Release the reference taken in handlerInvoke (kindEnv).
+		asEnvironment(w.environment).Release()
+		w.environment = 0
+	}
 	if w.window != 0 && w.ownsWindow {
 		destroyWindow(w.window)
+		w.window = 0
+	}
+	if w.window != 0 && !w.ownsWindow {
+		// Embedded: give the host its window back untouched.
+		removeWindowSubclass(w.window, subclassProcCB, w.id)
 		w.window = 0
 	}
 	// Drop any Dispatch closures that were queued but never delivered (their
@@ -478,3 +623,5 @@ func (w *webview) Destroy() {
 	w.dispatchMu.Unlock()
 	unregisterEngine(w.id)
 }
+
+func onUIThread() bool { return uiThreadID != 0 && getCurrentThreadID() == uiThreadID }

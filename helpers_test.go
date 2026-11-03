@@ -63,13 +63,23 @@ func (s *bindMethodsWebViewStub) SetTitle(_ string) {}
 
 func (s *bindMethodsWebViewStub) SetSize(_, _ int, _ Hint) {}
 
-func (s *bindMethodsWebViewStub) Navigate(_ string) {}
+func (s *bindMethodsWebViewStub) Navigate(_ string)             {}
+func (s *bindMethodsWebViewStub) GoBack()                       {}
+func (s *bindMethodsWebViewStub) GoForward()                    {}
+func (s *bindMethodsWebViewStub) Reload()                       {}
+func (s *bindMethodsWebViewStub) Stop()                         {}
+func (s *bindMethodsWebViewStub) Find(string, bool, func(bool)) {}
+func (s *bindMethodsWebViewStub) SetZoom(float64)               {}
 
 func (s *bindMethodsWebViewStub) SetHtml(_ string) {}
 
 func (s *bindMethodsWebViewStub) Init(_ string) {}
 
 func (s *bindMethodsWebViewStub) Eval(_ string) {}
+
+func (s *bindMethodsWebViewStub) Focus() {}
+
+func (s *bindMethodsWebViewStub) Raise() {}
 
 func (s *bindMethodsWebViewStub) Bind(name string, f any) error {
 	s.bindCalls++
@@ -85,13 +95,22 @@ func (s *bindMethodsWebViewStub) Bind(name string, f any) error {
 
 func (s *bindMethodsWebViewStub) Unbind(_ string) error { return nil }
 
+func (s *bindMethodsWebViewStub) OpenFile(_ FileDialogOptions) (string, error) { return "", nil }
+
+func (s *bindMethodsWebViewStub) OpenFiles(_ FileDialogOptions) ([]string, error) { return nil, nil }
+
+func (s *bindMethodsWebViewStub) SaveFile(_ FileDialogOptions) (string, error) { return "", nil }
+
+func (s *bindMethodsWebViewStub) OpenDirectory(_ FileDialogOptions) (string, error) { return "", nil }
+
 type bindMethodsService struct{}
 
 func (bindMethodsService) GetUserByID(_ int) int { return 1 }
 
 func (bindMethodsService) Ping() {}
 
-//nolint:unused // present to verify BindMethods skips unexported methods
+//lint:ignore U1000 present to verify BindMethods skips unexported methods
+//nolint:unused // same reason; staticcheck reads lint:ignore, golangci-lint reads nolint
 func (bindMethodsService) hidden() {}
 
 func TestBindMethods(t *testing.T) {
@@ -109,13 +128,16 @@ func TestBindMethods(t *testing.T) {
 	if names[1] != "api_ping" {
 		t.Fatalf("BindMethods() names[1] = %q, want %q", names[1], "api_ping")
 	}
-	if _, ok := w.bound["api_hidden"]; ok {
+	_, ok := w.bound["api_hidden"]
+	if ok {
 		t.Fatal("BindMethods() bound unexported method")
 	}
-	if _, ok := w.bound["api_get_user_by_id"]; !ok {
+	_, ok = w.bound["api_get_user_by_id"]
+	if !ok {
 		t.Fatal("BindMethods() missing binding for api_get_user_by_id")
 	}
-	if _, ok := w.bound["api_ping"]; !ok {
+	_, ok = w.bound["api_ping"]
+	if !ok {
 		t.Fatal("BindMethods() missing binding for api_ping")
 	}
 }

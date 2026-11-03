@@ -1,12 +1,17 @@
-// File picker example.
+// File picker example: the in-page web path via <input type="file">.
 //
-// Demonstrates <input type="file">. The native file dialog is provided:
+// The native file dialog here is provided by the webview, not by glaze:
 //   - macOS:   by glaze's WKUIDelegate (WKWebView shows no dialog on its own)
 //   - Linux:   by WebKitGTK's default run-file-chooser handler
 //   - Windows: by WebView2 itself
 //
 // Selecting files updates the page and calls a bound Go function, so this also
 // exercises the JS->Go bridge end to end with a slice argument.
+//
+// Note the browser only exposes the file NAMES to JavaScript, never their
+// filesystem paths (a web security boundary). When you need full paths -- or
+// want to save a file or choose a directory -- drive the dialog from Go with the
+// programmatic API instead; see examples/filedialog.
 package main
 
 import (
@@ -29,9 +34,10 @@ func main() {
 	w.SetSize(560, 440, glaze.HintNone)
 
 	// Bound so the selection round-trips to Go as well.
-	if err := w.Bind("picked", func(names []string) {
+	err = w.Bind("picked", func(names []string) {
 		log.Println("picked files:", names)
-	}); err != nil {
+	})
+	if err != nil {
 		log.Fatal(err)
 	}
 
@@ -54,7 +60,8 @@ func main() {
 </head>
 <body>
   <h1>File picker</h1>
-  <p>Click below to open the native file dialog (multiple selection allowed).</p>
+  <p>Click below to open the native file dialog (multiple selection allowed).
+     The browser exposes only file names here, not full paths.</p>
   <input type="file" id="f" multiple>
   <div id="out">No file selected yet.</div>
   <script>

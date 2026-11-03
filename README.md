@@ -4,19 +4,6 @@ Glaze is a desktop WebView binding for Go. It is a pure-Go port of [webview/webv
 
 It started as a fork of `go-webview` but has diverged enough to live as a separate codebase with its own goals and API.
 
-## Why no CGo
-
-Dragging a C toolchain into a Go project just to open a window with HTML breaks too much of what I like about the Go ecosystem -- easy cross-compilation, reproducible builds, `go install` that works for whoever clones the repo. With `purego` glaze calls the WebView framework already present on the system via dlopen / LoadLibrary, so the binary stays self-contained with no C toolchain and no bundled native library.
-
-## What's in the box
-
-- No CGo
-- Windows, macOS, and Linux
-- Zero bundled native libraries -- binds the OS WebView directly (WKWebView / WebKitGTK / WebView2)
-- JavaScript to Go binding
-- Helpers for common desktop patterns: `BindMethods`, `RenderHTML`, `AppWindow`
-- Plays nicely with `go.work` multi-module setups
-
 ## Examples
 
 | Desktop | Game of Life | Starfield |
@@ -30,6 +17,42 @@ Dragging a C toolchain into a Go project just to open a window with HTML breaks 
 | Raycasting | Filo REPL | |
 | --- | --- | --- |
 | [![Raycasting example preview](imgs/raycasting.gif)](examples/raycasting/) | [![Filo REPL example preview](imgs/filorepl.gif)](examples/filorepl/) | |
+
+## Why no CGo
+
+This is the whole point of the project, and it's the part that's easy to miss. Most native-WebView bindings reach for CGo, which quietly takes back the things that make Go pleasant to ship: cross-compiling suddenly needs a matching **C** cross-compiler for every target (mingw for Windows, a sysroot for Linux), builds stop being reproducible, and `go install` only works for people who already have that C toolchain set up.
+
+glaze keeps CGo out entirely - with [purego](https://github.com/ebitengine/purego) it `dlopen`/`LoadLibrary`s the WebView the OS already ships, so there is no C compiler in the loop. What that buys you:
+
+- **Cross-compile to every desktop from one machine** -- no C cross-toolchain, just `GOOS`/`GOARCH`:
+
+  ```sh
+  GOOS=windows GOARCH=amd64 go build   # from a Mac, from Linux, from anywhere
+  GOOS=linux   GOARCH=arm64 go build
+  GOOS=darwin  GOARCH=arm64 go build
+  ```
+
+- **`CGO_ENABLED=0` builds** -- reproducible output, and a `go get` / `go install` that just works for whoever clones the repo, with no compiler to install first.
+
+One caveat, "self-contained" isn't misread: glaze does **not** bundle a browser engine - it is not Electron. The binary ships no native library and stays small, but it uses the *system* WebView at runtime, so the target machine needs that present: WebView2 on Windows (preinstalled on current Windows 10/11), WebKitGTK on Linux (a package), WKWebView on macOS (built in).
+
+## What's in the box
+
+- No CGo
+- Windows, macOS, and Linux
+- Zero bundled native libraries -- binds the OS WebView directly (WKWebView / WebKitGTK / WebView2)
+- JavaScript to Go binding
+- Helpers for common desktop patterns: `BindMethods`, `RenderHTML`, `AppWindow`, a Go↔JS `Events` bridge
+- A dependency-free code editor component (`glaze/editor`): line numbers, syntax highlighting, autocompletion, error marks — Filo and SQL definitions included, languages pluggable
+- Native file dialogs (`OpenFile`/`OpenFiles`/`SaveFile`/`OpenDirectory`) and a reusable native menu bar (`glaze/menu`)
+- Custom URL schemes: serve embedded assets from a portless, secure-context `app://` origin (`NewWithOptions`)
+- Window control from Go: `SetTitle`, `SetSize`, `Focus` (keyboard focus into the web content) and `Raise` (front the window and activate the app)
+- `NewWindow(debug, window)` embeds the WebView into an existing native window (`New` is the create-a-window shortcut)
+- Plays nicely with `go.work` multi-module setups
+
+## Related: native
+
+Glaze stays focused on the window and the WebView. OS features that aren't window-bound -- and especially the more platform-specific or less standardized ones, like desktop notifications and the system tray -- live in [`native`](https://github.com/crgimenes/native), a sibling collection of small, cgo-free packages on the same purego foundation: clipboard, single-instance locks, opening a URL or revealing a file, memory-mapped files, keeping the machine awake, and more. The two don't depend on each other -- an application imports each directly for what it needs; where a platform can't support something cleanly, the native package returns a clear `ErrUnsupported` instead of shipping something flaky.
 
 ## Install
 
@@ -58,6 +81,10 @@ Always loaded:
 
 - GTK4: `libgtk-4.so.1`, `libwebkitgtk-6.0.so.4`, `libjavascriptcoregtk-6.0.so.1`
 - GTK3: `libgtk-3.so.0`, `libwebkit2gtk-4.1.so.0` (or `libwebkit2gtk-4.0.so.37`), `libjavascriptcoregtk-4.1.so.0` (or `libjavascriptcoregtk-4.0.so.18`)
+
+On the GTK4 stack, the file dialogs additionally load `libgio-2.0.so.0` the
+first time a dialog opens (it ships with GLib, so it is present wherever the
+libraries above are).
 
 Installing the WebKitGTK package pulls GTK and GLib in as dependencies:
 
@@ -161,7 +188,7 @@ What it does:
 - Creates a native window and navigates it to that local URL.
 - Runs the UI loop and shuts down the HTTP server when the window exits.
 - Supports window sizing, title, debug mode, and an optional readiness callback.
-  - `OnReady` receives the browser URL (always `http://127.0.0.1:...`).
+  - `OnReady` receives the browser URL (loopback; `http://127.0.0.1:...`, or `http://[::1]:...` if you pass an IPv6 `Addr`).
   - `OnReadyInfo` receives the resolved backend details (`Transport`, `Backend`, `Gateway`) so you can verify unix vs tcp from logs.
 
 The shortest path from an existing `net/http` app to a desktop app, with minimal changes to routing, templates, and assets.
@@ -179,17 +206,291 @@ err := glaze.AppWindow(glaze.AppOptions{
 })
 ```
 
-## Running the examples
+### Custom URL schemes
 
-From the repository root:
+Serve a window's assets from your own `app://`-style origin -- one that WebKit
+and WebView2 treat as a **secure context** -- without opening a TCP port. Hand
+`NewWithOptions` a map of scheme name to handler; the handler turns a request
+into bytes:
 
-```bash
-go run ./examples/simple
-go run ./examples/bind
-go run ./examples/zero_tcp
+```go
+//go:embed ui
+var uiFS embed.FS
+
+w, err := glaze.NewWithOptions(glaze.Options{
+    Debug: true,
+    SchemeHandlers: map[string]glaze.SchemeHandler{
+        "app": func(req *glaze.SchemeRequest) *glaze.SchemeResponse {
+            data, ctype := serve(req.URL) // from your embedded FS, however you like
+            if data == nil {
+                return nil // a nil response is a 404
+            }
+            return &glaze.SchemeResponse{Body: data, MIMEType: ctype}
+        },
+    },
+})
+w.Navigate("app://home/index.html") // secure origin, no port
 ```
 
-From each example directory:
+Why not just `file://` or `SetHtml`? Because neither is a **secure context**,
+and a large part of the web platform is gated behind one:
+
+| Approach | Port? | Secure context? |
+| --- | --- | --- |
+| Loopback `http://127.0.0.1:<port>` server | opens a port | yes |
+| `file://` / `SetHtml` | no port | **no** -- `crypto.subtle` is undefined, `getUserMedia`/geolocation are blocked, `localStorage` is unreliable, routing is hash-only |
+| **Custom scheme (this)** | **no port** | **yes** -- `localStorage`, `crypto.subtle`, `getUserMedia`, and path routing all work |
+
+Handlers are supplied at construction (not added later) because macOS bakes the
+scheme handlers into the `WKWebViewConfiguration` before the `WKWebView` exists.
+`New`/`NewWindow` delegate to `NewWithOptions`, so existing code is unaffected.
+
+Each backend uses its own native mechanism, and each registers a real scheme:
+macOS a `WKURLSchemeHandler`; Linux `webkit_web_context_register_uri_scheme`
+marked secure; Windows a WebView2 custom scheme registration (secure, with an
+authority; needs Edge WebView2 Runtime 110 or later). So `app://home` is the
+page's origin on every platform, absolute `app://home/...` links and
+sub-resources load everywhere, and your handler sees the same URL everywhere.
+On Windows the windows that register schemes keep their WebView2 profile in a
+folder of their own, `%APPDATA%\<exe>-schemes`, apart from windows without
+schemes, because WebView2 requires windows sharing a profile to register
+identical schemes. That also means every window in a process registers the
+same set; a second set is refused with an error. See
+[examples/scheme](examples/scheme/).
+
+### Untrusted content: no bridge
+
+The JS↔Go bridge (`window.__webview__` plus a native message handler) is
+installed in every page the web view loads. That is right for an app serving
+its own HTML, and wrong for one that loads pages it does not control — a
+remote page would get a channel back to the process.
+
+```go
+w, err := glaze.NewWithOptions(glaze.Options{NoBridge: true})
+```
+
+With `NoBridge` nothing is injected and no handler is registered (on Windows,
+web messages are also disabled in the WebView2 settings). `Bind` and `Unbind`
+return `ErrBridgeDisabled`; `Init`, `Eval` and scheme handlers keep working.
+
+### No white flash while the first page loads
+
+An empty web view paints white. In a dark room, with a dark desktop, that is a
+flash in the user's face every time a window opens.
+
+```go
+w, err := glaze.NewWithOptions(glaze.Options{HideUntilLoaded: true})
+```
+
+The web view stays hidden, and the window shows its native background, until
+the first navigation finishes or fails. Later navigations are not affected.
+macOS and Linux; ignored on Windows.
+
+### Knowing when a page loaded or failed
+
+```go
+w, err := glaze.NewWithOptions(glaze.Options{
+    OnNavigation: func(ev glaze.NavigationEvent) {
+        if ev.Kind == glaze.NavigationFailed {
+            log.Printf("%s: %v", ev.URL, ev.Err)
+        }
+    },
+})
+```
+
+Called on the UI thread when a main-frame navigation finishes or fails; a
+panic in the handler is contained. For a failure that never reached the
+server, `URL` is the one that failed, not the page still on screen. `TLS`
+marks a failed secure connection (untrusted, expired or mismatched
+certificate); the engine refuses it, there is no way around it here. A
+navigation cancelled because another replaced it is not reported. Setting
+`OnNavigation` means the app handles failures: on Linux, WebKitGTK's built-in
+error page is not loaded (macOS has none), so the previous page stays. macOS
+and Linux; never called on Windows.
+
+### New windows the page asks for
+
+```go
+w, err := glaze.NewWithOptions(glaze.Options{
+    OnNewWindow: func(url string) { openSomewhere(url) },
+})
+```
+
+A `target=_blank` link or `window.open` never opens a window by itself: the URL
+goes to `OnNewWindow` (on the UI thread) and the page's `window.open` returns
+null. Popups need a user gesture on both engines -- glaze turns off macOS's
+default of letting scripts open windows on their own. macOS and Linux; never
+called on Windows.
+
+### Knowing a window was closed
+
+```go
+w, err := glaze.NewWithOptions(glaze.Options{
+    OnClose: func() { forget(w) },
+})
+```
+
+`OnClose` runs on the UI thread when the person closes the window (its close
+button, Alt+F4, Cmd-W), once the window is gone; never after `Destroy`. With
+several windows on one loop it is how the app learns that one of them closed:
+`Run` returns for the last window only on Windows, and for the window it was
+called on only on Linux. Call `Destroy` afterwards to release the web view.
+
+### First click on an inactive window (macOS)
+
+On macOS a click on a window that does not have focus is spent *activating* the
+window: it never reaches the page. For a control panel, a dashboard or a player
+-- anything the user clicks in passing -- that reads as a broken button, and the
+user ends up clicking twice.
+
+```go
+w, err := glaze.NewWithOptions(glaze.Options{AcceptsFirstMouse: true})
+```
+
+It is **opt-in**, and deliberately so: the AppKit default is what protects
+destructive interfaces. In a drawing tool, an editor, or any window with a
+delete button, a click that merely raises the window must not also press
+whatever happens to sit under the cursor. Leave it off when a stray first click
+could destroy something.
+
+macOS only; ignored on Linux and Windows, where a click on an inactive window
+already reaches the content. The mechanism is a `WKWebView` subclass answering
+`YES` to `acceptsFirstMouse:` -- AppKit asks the *view* under the cursor, so
+there is no window-level or runtime switch for it.
+
+**It is not always enough.** AppKit will deliver the click to the view, but
+WebKit hosts the page in another process and does not always forward that first
+click to the DOM while the window is not key -- measured, not assumed. When a
+program *knows* it took its own focus away (it launched a window that
+activates, say), the reliable answer is to take the focus back:
+
+```go
+w.Raise() // front the window and activate the app; the next click just works
+```
+
+`Raise` is the blunt instrument and should be used sparingly -- stealing focus
+from someone typing in another application is worse than the second click it
+saves. `Focus` is the other half: it moves the caret *inside* the page.
+
+### Events
+
+A lightweight publish/subscribe bridge between Go and JavaScript, layered on
+`Bind`/`Init`/`Eval` with no extra native code. Create one per window, then emit
+and subscribe on either side; an event reaches every listener on both sides
+exactly once.
+
+```go
+ev, err := glaze.NewEvents(w)
+if err != nil {
+	log.Fatal(err)
+}
+
+// Go subscribes; each argument arrives as raw JSON to decode as you like.
+ev.On("ui:save", func(args ...json.RawMessage) {
+	var name string
+	_ = json.Unmarshal(args[0], &name)
+	log.Println("save requested for", name)
+})
+
+// Go emits to JS — safe to call from any goroutine.
+_ = ev.Emit("app:ready", map[string]any{"version": 3})
+```
+
+```js
+// JS subscribes to Go events and emits its own.
+glaze.events.on("app:ready", (info) => console.log("ready", info.version));
+glaze.events.emit("ui:save", "untitled.txt");
+```
+
+`On` returns a function that cancels that one subscription; `Off(name)` drops all
+of them. Go handlers run on the goroutine that emitted (or the binding goroutine
+for events coming from JS), so re-enter the UI thread with `Dispatch` if a handler
+touches the window. See [examples/events](examples/events/).
+
+### File dialogs
+
+Native open/save/directory dialogs, exposed on the `WebView` interface (a glaze
+extension; upstream webview has none):
+
+```go
+path, _  := w.OpenFile(glaze.FileDialogOptions{
+    Title:   "Open an image",
+    Filters: []glaze.FileFilter{{Name: "Images", Extensions: []string{"png", "jpg"}}},
+})
+paths, _ := w.OpenFiles(glaze.FileDialogOptions{})                     // multi-select
+saveTo, _ := w.SaveFile(glaze.FileDialogOptions{Filename: "untitled.txt"})
+dir, _   := w.OpenDirectory(glaze.FileDialogOptions{})
+```
+
+Backends: `NSOpenPanel`/`NSSavePanel` (macOS), `IFileOpenDialog`/`IFileSaveDialog`
+(Windows), `GtkFileChooserNative` (Linux). Each shows the modal dialog, blocks the
+calling goroutine, and returns the chosen path(s) or `""` on cancel. Call them
+from `Bind` callbacks (a background goroutine), never from the UI thread. See
+[examples/filedialog](examples/filedialog/).
+
+### Native menus
+
+[`github.com/crgimenes/glaze/menu`](menu/) installs a native menu bar. It depends
+only on purego, not on the WebView, so a game or any other window-owning app can
+use it the same way.
+
+```go
+menu.Set([]menu.Item{
+    {Title: "App", Submenu: []menu.Item{
+        {Title: "About", OnClick: showAbout},
+        {Separator: true},
+        {Title: "Quit", Shortcut: "cmd+q", OnClick: w.Terminate},
+    }},
+    {Title: "Edit", Submenu: []menu.Item{
+        {Title: "Copy", Shortcut: "cmd+c", OnClick: doCopy},
+    }},
+}, menu.Options{Window: w.Window()})
+```
+
+macOS (`NSMenu`) and Windows (Win32 menu bar, shortcuts not wired) are
+implemented. Linux draws no menu bar, but the items' shortcuts work: a key
+handler on the window (capture phase, GTK3 or GTK4) runs the item and keeps the
+key from the page; `cmd` reads as `ctrl` there, and any other key reaches the
+page as usual. Selector items are skipped on Linux, where the focused widget
+already handles copy and paste. See [examples/menu](examples/menu/).
+
+### Icons
+
+Two icons look alike and are not the same thing. The **application** icon is
+the process's face in the Dock, the taskbar or the switcher: `SetAppIcon(png)`
+sets it at runtime on macOS, and reports `ErrIconUnsupported` on Windows and
+Linux, where it comes from the executable's resources or the desktop entry,
+both fixed before the process exists. The **window** icon sits in the title
+bar and on the taskbar button; macOS has none, and on Windows glaze gives its
+windows the first icon of the executable, so embed one (a `.syso` built with
+a tool such as `go-winres` or `rsrc`) and nothing else is needed; without it
+the window shows the generic one. On Linux the desktop entry or the AppImage
+provides it, and GTK4 has no call to set one from bytes at runtime.
+
+## System tray
+
+glaze has no tray of its own, but it cooperates with one: when another
+library's event loop is already running — such as
+[`native/tray`](https://github.com/crgimenes/native) — `New` detects it,
+builds the window on the UI thread, and `Run` returns when that window closes
+instead of trying to own the loop. A tray menu item can open a webview
+synchronously from its `OnClick`, and closing the window leaves the tray
+running. See [examples/tray](examples/tray/).
+
+## Running the examples
+
+`examples/` is a separate Go module (it keeps the library's `go.mod`
+purego-only), so run the examples from inside it:
+
+```bash
+cd examples
+go run ./simple
+go run ./bind
+go run ./zero_tcp
+go run ./scheme
+```
+
+Or from each example directory:
 
 ```bash
 cd examples/appwindow && go run .
@@ -197,7 +498,14 @@ cd examples/desktop && go run .
 cd examples/filorepl && go run .
 ```
 
-`examples/zero_tcp` shows a local-first UI built with `SetHtml + BindMethods` only -- no HTTP server, no loopback TCP gateway.
+`examples/zero_tcp` shows a local-first UI with no HTTP server and no loopback
+TCP gateway: it stages the frontend to disk, navigates to a `file://` URL, and
+talks to Go through `BindMethods` alone.
+
+`examples/scheme` is the secure-context counterpart: it serves an embedded
+frontend from a portless `app://` origin via a custom scheme handler, so
+`localStorage`, `crypto.subtle`, and path routing all work (they do not on the
+`file://` origin above).
 
 ## Testing
 
@@ -211,6 +519,13 @@ plus the per-platform GUI smoke tests, which drive a real WebView
 system WebView can't run here -- no display, or the libraries aren't installed
 (WebKitGTK on Linux, the Edge WebView2 Runtime on Windows) -- so the command
 above stays green on a headless or minimal box instead of failing.
+
+For a fast, headless run, `-short` skips the GUI scenarios on every platform
+(each drives a real run loop and can take a few seconds):
+
+```bash
+go test -short ./...
+```
 
 To actually exercise the GUI tests on Linux, install WebKitGTK and run under a
 virtual display:
@@ -232,8 +547,12 @@ go build -ldflags="-H windowsgui" .
 - `webview_common.go` -- the `WebView` interface, function-wrapper, and JS marshalling
 - `webview_bridge.go` / `webview_bridge_webkit.go` -- the injected JS bridge (init/bind scripts)
 - `webview_darwin.go` / `webview_linux.go` / `webview_windows.go` (+ `webview2_windows.go`, `putbounds_amd64.go`, `putbounds_arm64.go`) -- the per-OS pure-Go backends
+- `scheme.go` (+ `webview2_scheme_windows.go`) -- the custom URL-scheme handler API (`NewWithOptions` / `SchemeHandler`)
 - `appwindow.go` -- desktop window + local HTTP server helper
+- `dialog.go` / `dialog_darwin.go` / `dialog_windows.go` / `dialog_linux.go` -- native file dialogs
 - `helpers.go` -- utility helpers (`BindMethods`, `RenderHTML`)
+- `events.go` -- the Go↔JS publish/subscribe events bridge (`NewEvents`)
+- `menu/` -- the standalone native menu-bar package (`github.com/crgimenes/glaze/menu`)
 - `examples/` -- runnable sample applications (their own Go module)
 
 Glaze loads the OS WebView framework directly and bundles or extracts no native library, so there is no extracted file to verify or swap.
@@ -243,3 +562,15 @@ Glaze loads the OS WebView framework directly and bundles or extracts no native 
 - [abemedia/go-webview](https://github.com/abemedia/go-webview) for the original Go binding base
 - [webview/webview](https://github.com/webview/webview) for the original C++ WebView implementation this is ported from
 - [purego](https://github.com/ebitengine/purego) for dynamic linking without CGo
+
+---
+
+## More of my projects
+
+- [filo](https://github.com/crgimenes/filo): a small scripting language safe to embed in Go programs.
+- [keikiban](https://github.com/crgimenes/keikiban): a PostgreSQL dashboard; database load, top SQL, locks, index health.
+- [kutta](https://github.com/crgimenes/kutta): a 2D wind tunnel; watch air misbehave around an airfoil.
+- [minigui](https://github.com/crgimenes/minigui): a tiny immediate-mode GUI for Ebitengine.
+- [neko](https://github.com/crgimenes/neko): the classic desktop cat chasing your pointer, in Go.
+
+More at [github.com/crgimenes](https://github.com/crgimenes) and [crg.eti.br](https://crg.eti.br).
